@@ -1,0 +1,13 @@
+<resources>
+    <string name="app_name">Volume Guard</string>
+    <string name="accessibility_service_name">Volume Guard Key Interceptor</string>
+    <string name="accessibility_service_description">Monitors physical Volume Up and Down keys to enforce media volume 0 protection and allow emergency Volume Up override.</string>
+    <string name="guard_active">Guard Active</string>
+    <string name="guard_inactive">Guard Inactive</string>
+    <string name="accessibility_required_title">Accessibility Service Required</string>
+    <string name="accessibility_required_desc">Physical Volume Up and Down key interception requires Volume Guard\'s Accessibility Service. Android requires you to enable this service in system settings.</string>
+    <string name="open_accessibility_settings">Open Accessibility Settings</string>
+    <string name="volume_target_info">Protected media volume is strictly locked to 0.</string>
+    <string name="physical_up_info">Pressing physical Volume Up disables the guard immediately and allows volume to increase normally.</string>
+    <string name="physical_down_info">Pressing physical Volume Down keeps the guard active and forces volume to 0.</string>
+</resources>

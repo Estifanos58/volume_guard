@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Outer Shield Outline -->
+    <path
+        android:pathData="M54,24 L78,32 C78,56 68,74 54,84 C40,74 30,56 30,32 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:startX="54"
+                android:startY="24"
+                android:endX="54"
+                android:endY="84"
+                android:type="linear">
+                <item android:color="#0284C7" android:offset="0.0" />
+                <item android:color="#0369A1" android:offset="1.0" />
+            </gradient>
+        </aapt:attr>
+    </path>
+    <!-- Inner Shield Inset -->
+    <path
+        android:pathData="M54,27.5 L75,34.5 C75,55 65.5,71.5 54,80.5 C42.5,71.5 33,55 33,34.5 Z"
+        android:fillColor="#0F172A" />
+    <!-- Speaker Body -->
+    <path
+        android:pathData="M41,47 L46,47 L53,41 L53,67 L46,61 L41,61 Z"
+        android:fillColor="#38BDF8" />
+    <!-- Volume Mute Slash / X -->
+    <!-- Sound Waves with Slash or '0' badge -->
+    <!-- Elegant '0' badge indicating volume locked to zero -->
+    <path
+        android:pathData="M61,46 C58.5,46 56.5,48.5 56.5,54 C56.5,59.5 58.5,62 61,62 C63.5,62 65.5,59.5 65.5,54 C65.5,48.5 63.5,46 61,46 Z M61,49 C62,49 62.7,51 62.7,54 C62.7,57 62,59 61,59 C60,59 59.3,57 59.3,54 C59.3,51 60,49 61,49 Z"
+        android:fillColor="#F8FAFC" />
+    <!-- Lock / Guard Dot -->
+    <path
+        android:pathData="M68,54 A2,2 0 1 1 68,53.99 Z"
+        android:fillColor="#38BDF8" />
+</vector>

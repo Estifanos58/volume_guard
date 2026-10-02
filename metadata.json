@@ -1,0 +1,6 @@
+{
+  "name": "Volume Guard",
+  "description": "Defensive media volume protection utility that locks media volume to 0 and intercepts hardware volume keys.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
