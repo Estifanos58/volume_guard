@@ -15,7 +15,7 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * Interface for registering and unregistering reactive volume monitors on demand.
+ * Interface for registering and unregistering the volume broadcast receiver on demand.
  */
 fun interface VolumeMonitorController {
     fun setMonitorsActive(active: Boolean)
@@ -24,18 +24,14 @@ fun interface VolumeMonitorController {
 /**
  * Centralized, thread-safe coordinator for Volume Guard state and actions.
  *
- * Latency & Audio Leak Prevention Architecture:
- * 1. Proactive Mute on Operational State Entry:
- *    - When Guard enters active operational protection, it immediately issues
- *      [setStreamVolume(STREAM_MUSIC, 0, 0)] AND [adjustStreamVolume(ADJUST_MUTE)].
- *    - This pre-mutes the hardware audio output so if another app programmatically
- *      raises the volume index, audio leakage is minimized/prevented before correction.
- * 2. Single [setStreamVolume(STREAM_MUSIC, 0, 0)] for reactive corrections:
- *    - Ordinary reactive corrections do NOT reissue ADJUST_MUTE; exactly one call is made.
- * 3. Proactive Mute Lifted on Disengage:
- *    - When Guard is disabled via UI, physical Volume Up, or service disconnect,
- *      [adjustStreamVolume(ADJUST_UNMUTE)] is called to restore normal volume responsiveness.
- * 4. Zero audio IPC on physical Volume Down when cached volume is 0.
+ * Streamlined Architecture:
+ * 1. Cached [AudioManager] reference eliminates repeated getSystemService() lookups.
+ * 2. Pure reactive correction: exactly one setStreamVolume(STREAM_MUSIC, 0, 0) on violation.
+ * 3. No proactive mute/unmute: target volume is strictly 0 without audio HAL muting tricks.
+ * 4. Physical Volume Up has ZERO audio Binder calls and returns false immediately.
+ * 5. Physical Volume Down checks [lastKnownMediaVolume] and performs ZERO audio Binder calls
+ *    when volume is already 0.
+ * 6. Disabling Guard never restores any previous volume.
  */
 class GuardManager private constructor() {
 
@@ -57,6 +53,11 @@ class GuardManager private constructor() {
     private val _recentLogs = MutableStateFlow<List<String>>(emptyList())
     val recentLogs: StateFlow<List<String>> = _recentLogs.asStateFlow()
 
+    // Cached AudioManager reference to avoid repeated getSystemService() lookups
+    @Volatile
+    var audioManager: AudioManager? = null
+        private set
+
     // Volatile cached media volume for O(1) checks without Binder IPC
     @Volatile
     var lastKnownMediaVolume: Int = 0
@@ -67,10 +68,11 @@ class GuardManager private constructor() {
 
     @Synchronized
     fun initialize(context: Context) {
-        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-        if (audioManager != null) {
-            _maxMediaVolume.value = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-            val current = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+        audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        val am = audioManager
+        if (am != null) {
+            _maxMediaVolume.value = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+            val current = am.getStreamVolume(AudioManager.STREAM_MUSIC)
             _currentMediaVolume.value = current
             lastKnownMediaVolume = current
         }
@@ -81,7 +83,13 @@ class GuardManager private constructor() {
     }
 
     @Synchronized
+    fun setAudioManager(am: AudioManager?) {
+        this.audioManager = am
+    }
+
+    @Synchronized
     fun onServiceConnected(context: Context, controller: VolumeMonitorController) {
+        audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
         monitorController = controller
         _isServiceConnected.value = true
 
@@ -94,7 +102,7 @@ class GuardManager private constructor() {
         updateOperationalState(context)
 
         if (_isOperationalActive.value) {
-            proactiveMute(context)
+            forceMediaVolumeZero(context, reason = "Service connected with desired ON")
         }
     }
 
@@ -106,14 +114,14 @@ class GuardManager private constructor() {
         _isServiceConnected.value = false
         monitorController?.setMonitorsActive(false)
         monitorController = null
-        if (context != null) {
-            liftProactiveMute(context)
-        }
         updateOperationalState(null)
     }
 
     @Synchronized
     fun setDesiredGuardEnabled(context: Context, enabled: Boolean) {
+        if (audioManager == null) {
+            audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        }
         _desiredGuardEnabled.value = enabled
         GuardPreferences.getInstance(context).isGuardEnabled = enabled
         if (BuildConfig.DEBUG) {
@@ -123,24 +131,22 @@ class GuardManager private constructor() {
         updateOperationalState(context)
 
         if (enabled && _isOperationalActive.value) {
-            proactiveMute(context)
-        } else if (!enabled) {
-            liftProactiveMute(context)
+            forceMediaVolumeZero(context, reason = "Guard activated by user")
         }
+        // When disabled: leaves volume untouched at whatever value Android currently has
     }
 
     /**
      * Ultra-fast hot-path handler for physical Volume Up key event.
-     * Disengages guard immediately, lifts proactive mute, and returns without audio IPCs.
+     * Disengages guard immediately, updates persistent state, and returns without audio IPCs.
      */
     fun onPhysicalVolumeUpFast(context: Context) {
         _desiredGuardEnabled.value = false
         _isOperationalActive.value = false
         lastKnownMediaVolume = 0
         GuardPreferences.getInstance(context).isGuardEnabled = false
-        liftProactiveMute(context)
         if (BuildConfig.DEBUG) {
-            logDebug("Physical Volume Up -> Disengaged guard, mute lifted")
+            logDebug("Physical Volume Up -> Disengaged guard")
         }
     }
 
@@ -157,8 +163,7 @@ class GuardManager private constructor() {
 
     /**
      * Primary reactive volume-change handler.
-     * Called when a volume increase is reported by the broadcast receiver or fallback observer.
-     * Executes exactly one setStreamVolume(STREAM_MUSIC, 0, 0) call.
+     * Executes exactly one setStreamVolume(STREAM_MUSIC, 0, 0) call using cached AudioManager.
      */
     fun onMusicVolumeIncreaseDetected(context: Context, newVolume: Int) {
         lastKnownMediaVolume = newVolume
@@ -177,50 +182,12 @@ class GuardManager private constructor() {
     }
 
     /**
-     * Proactively sets volume to 0 AND mutes STREAM_MUSIC when Guard enters operational state.
-     * Prevents audible leaks before another app attempts an increase.
-     */
-    fun proactiveMute(context: Context) {
-        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
-        try {
-            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0)
-            audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_MUTE, 0)
-            lastKnownMediaVolume = 0
-            _currentMediaVolume.value = 0
-            if (BuildConfig.DEBUG) {
-                logDebug("Proactive mute applied to STREAM_MUSIC")
-            }
-        } catch (e: Exception) {
-            if (BuildConfig.DEBUG) {
-                Log.e(TAG, "Error applying proactive mute", e)
-            }
-        }
-    }
-
-    /**
-     * Unmutes STREAM_MUSIC when Guard is turned OFF, Volume Up is pressed, or service disconnects.
-     */
-    fun liftProactiveMute(context: Context) {
-        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
-        try {
-            audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, 0)
-            if (BuildConfig.DEBUG) {
-                logDebug("Proactive mute lifted on STREAM_MUSIC")
-            }
-        } catch (e: Exception) {
-            if (BuildConfig.DEBUG) {
-                Log.e(TAG, "Error lifting proactive mute", e)
-            }
-        }
-    }
-
-    /**
-     * Forces AudioManager.STREAM_MUSIC to volume 0 using exactly one setStreamVolume call.
+     * Forces AudioManager.STREAM_MUSIC to volume 0 using cached AudioManager.
      */
     fun forceMediaVolumeZero(context: Context, reason: String = "") {
-        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+        val am = audioManager ?: (context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager) ?: return
         try {
-            audioManager.setStreamVolume(
+            am.setStreamVolume(
                 AudioManager.STREAM_MUSIC,
                 0,
                 0 // 0 flags: no UI slider popup
@@ -238,8 +205,8 @@ class GuardManager private constructor() {
     }
 
     fun syncSystemVolume(context: Context) {
-        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
-        val vol = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+        val am = audioManager ?: (context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager) ?: return
+        val vol = am.getStreamVolume(AudioManager.STREAM_MUSIC)
         lastKnownMediaVolume = vol
         _currentMediaVolume.value = vol
         if (_isOperationalActive.value && vol > 0) {

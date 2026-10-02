@@ -5,40 +5,34 @@ import android.accessibilityservice.AccessibilityServiceInfo
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.media.AudioDeviceCallback
-import android.media.AudioDeviceInfo
-import android.media.AudioManager
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
 import android.os.Process
-import android.provider.Settings
 import android.util.Log
 import android.view.KeyEvent
 import android.view.accessibility.AccessibilityEvent
 import com.example.BuildConfig
 import com.example.core.GuardManager
-import com.example.observer.VolumeContentObserver
 import com.example.receiver.VolumeChangeReceiver
 
 /**
- * Ultra-low latency Accessibility Service responsible for physical volume-key filtering
- * and high-priority reactive audio protection.
+ * Ultra-lean, low-latency Accessibility Service responsible for physical volume-key filtering
+ * and event-driven reactive volume enforcement.
  *
- * Latency & Auditory Leak Prevention Architecture:
+ * Streamlined Architecture:
  * 1. Physical Key Hot Path:
  *    - Uses [@Volatile isOperationalFast] for O(1) decision making with ZERO allocations.
- *    - Volume Up (Override): Flips local flag OFF, lifts proactive mute, persists preference,
- *      schedules monitor cleanup asynchronously, and immediately returns FALSE.
- *    - Volume Down: Consumes key (returns TRUE) with ZERO audio IPC if cached volume is already 0.
- * 2. Dedicated Background Monitor Thread:
- *    - Reactive monitors run on a high-priority [HandlerThread] (Process.THREAD_PRIORITY_URGENT_AUDIO)
- *      to eliminate main looper queue latency.
- * 3. Proactive Mute & Targeted Fallback:
- *    - Operates with proactive STREAM_MUSIC mute on activation to minimize auditory leaks.
- *    - Narrowly scoped [VolumeContentObserver] on the same dedicated background thread.
- *    - [AudioDeviceCallback] reasserting volume 0 when Bluetooth/headsets route audio.
+ *    - Volume Up (Override): Immediately sets local flag OFF, transitions desired state OFF,
+ *      schedules monitor cleanup asynchronously, and returns FALSE with ZERO audio IPC.
+ *    - Volume Down: Consumed with TRUE. Performs ZERO audio IPC when cached volume is already 0.
+ * 2. Dedicated Normal-Priority HandlerThread:
+ *    - Active strictly while Guard is operational.
+ *    - Uses [Process.THREAD_PRIORITY_DEFAULT] to avoid unnecessary real-time thread priority.
+ * 3. Minimal Monitoring:
+ *    - Relies purely on the primary [VolumeChangeReceiver] for VOLUME_CHANGED_ACTION.
+ *    - Redundant observers and audio device callbacks removed for minimal resource usage.
  */
 class VolumeGuardAccessibilityService : AccessibilityService() {
 
@@ -51,8 +45,6 @@ class VolumeGuardAccessibilityService : AccessibilityService() {
     private var monitorHandler: Handler? = null
 
     private var volumeChangeReceiver: VolumeChangeReceiver? = null
-    private var volumeContentObserver: VolumeContentObserver? = null
-    private var audioDeviceCallback: AudioDeviceCallback? = null
 
     public override fun onServiceConnected() {
         super.onServiceConnected()
@@ -84,7 +76,7 @@ class VolumeGuardAccessibilityService : AccessibilityService() {
             if (event.action == KeyEvent.ACTION_DOWN) {
                 // 1. Immediately flip local fast flag to false
                 isOperationalFast = false
-                // 2. Synchronous state update, lifts proactive mute, and async preference persistence
+                // 2. Synchronous state update and async preference persistence (ZERO audio IPC)
                 GuardManager.instance.onPhysicalVolumeUpFast(this)
                 // 3. Post monitor cleanup asynchronously off the critical hot path
                 asyncCleanupHandler.post {
@@ -97,7 +89,7 @@ class VolumeGuardAccessibilityService : AccessibilityService() {
 
         if (keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
             if (event.action == KeyEvent.ACTION_DOWN) {
-                // Zero IPC if volume is already known to be 0
+                // Zero audio IPC if cached volume is already known to be 0
                 GuardManager.instance.onPhysicalVolumeDownFast(this)
             }
             // Consume physical Volume Down so volume remains 0 and system work is skipped
@@ -136,7 +128,7 @@ class VolumeGuardAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * Activates or deactivates reactive volume monitors dynamically based on operational state.
+     * Activates or deactivates the volume monitor dynamically based on operational state.
      */
     fun setMonitorsActive(active: Boolean) {
         isOperationalFast = active
@@ -149,9 +141,9 @@ class VolumeGuardAccessibilityService : AccessibilityService() {
 
     private fun registerMonitors() {
         try {
-            // Start dedicated high-priority HandlerThread for reactive audio monitoring
+            // Start dedicated normal-priority HandlerThread for reactive audio monitoring
             if (monitorThread == null) {
-                monitorThread = HandlerThread("VolumeGuardMonitor", Process.THREAD_PRIORITY_URGENT_AUDIO).apply {
+                monitorThread = HandlerThread("VolumeGuardMonitor", Process.THREAD_PRIORITY_DEFAULT).apply {
                     start()
                 }
                 monitorHandler = Handler(monitorThread!!.looper)
@@ -159,7 +151,7 @@ class VolumeGuardAccessibilityService : AccessibilityService() {
 
             val handler = monitorHandler ?: Handler(Looper.getMainLooper())
 
-            // 1. Primary monitor: VOLUME_CHANGED_ACTION broadcast receiver on background handler
+            // Primary monitor: VOLUME_CHANGED_ACTION broadcast receiver on background handler
             if (volumeChangeReceiver == null) {
                 volumeChangeReceiver = VolumeChangeReceiver()
                 val filter = IntentFilter(VolumeChangeReceiver.VOLUME_CHANGED_ACTION)
@@ -169,39 +161,9 @@ class VolumeGuardAccessibilityService : AccessibilityService() {
                     registerReceiver(volumeChangeReceiver, filter, null, handler)
                 }
             }
-
-            // 2. Fallback monitor: Narrowly scoped ContentObserver on background handler
-            if (volumeContentObserver == null) {
-                volumeContentObserver = VolumeContentObserver(this, handler)
-                val musicUri = Settings.System.getUriFor("volume_music_speaker")
-                    ?: Settings.System.getUriFor("volume_music")
-                if (musicUri != null) {
-                    contentResolver.registerContentObserver(musicUri, false, volumeContentObserver!!)
-                } else {
-                    contentResolver.registerContentObserver(Settings.System.CONTENT_URI, false, volumeContentObserver!!)
-                }
-            }
-
-            // 3. AudioDeviceCallback for Bluetooth/headset routing changes on background handler
-            if (audioDeviceCallback == null) {
-                val am = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-                if (am != null) {
-                    audioDeviceCallback = object : AudioDeviceCallback() {
-                        override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>?) {
-                            if (isOperationalFast) {
-                                GuardManager.instance.forceMediaVolumeZero(
-                                    this@VolumeGuardAccessibilityService,
-                                    reason = "Audio device connected"
-                                )
-                            }
-                        }
-                    }
-                    am.registerAudioDeviceCallback(audioDeviceCallback!!, handler)
-                }
-            }
         } catch (e: Exception) {
             if (BuildConfig.DEBUG) {
-                Log.e(TAG, "Error registering volume monitors", e)
+                Log.e(TAG, "Error registering volume monitor", e)
             }
         }
     }
@@ -212,21 +174,12 @@ class VolumeGuardAccessibilityService : AccessibilityService() {
                 unregisterReceiver(it)
                 volumeChangeReceiver = null
             }
-            volumeContentObserver?.let {
-                contentResolver.unregisterContentObserver(it)
-                volumeContentObserver = null
-            }
-            if (audioDeviceCallback != null) {
-                val am = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-                audioDeviceCallback?.let { am?.unregisterAudioDeviceCallback(it) }
-                audioDeviceCallback = null
-            }
             monitorThread?.quitSafely()
             monitorThread = null
             monitorHandler = null
         } catch (e: Exception) {
             if (BuildConfig.DEBUG) {
-                Log.e(TAG, "Error unregistering volume monitors", e)
+                Log.e(TAG, "Error unregistering volume monitor", e)
             }
         }
     }

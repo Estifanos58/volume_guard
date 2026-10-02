@@ -7,7 +7,6 @@ import android.view.KeyEvent
 import androidx.test.core.app.ApplicationProvider
 import com.example.core.GuardManager
 import com.example.core.GuardPreferences
-import com.example.observer.VolumeContentObserver
 import com.example.receiver.VolumeChangeReceiver
 import com.example.service.VolumeGuardAccessibilityService
 import org.junit.Assert.assertEquals
@@ -37,8 +36,10 @@ class VolumeGuardTest {
         audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
         guardManager = GuardManager.instance
 
-        // Ensure fresh state in preferences
+        // Ensure fresh state in preferences and current test's AudioManager
         GuardPreferences.getInstance(context).isGuardEnabled = false
+        guardManager.initialize(context)
+        guardManager.setAudioManager(audioManager)
 
         // Instantiate and connect service via Robolectric
         serviceController = Robolectric.buildService(VolumeGuardAccessibilityService::class.java).create()
@@ -47,10 +48,9 @@ class VolumeGuardTest {
     }
 
     /**
-     * Test 1 — Operational Activation with Proactive Mute:
+     * Test 1 — Operational Activation:
      * When user enables guard and AccessibilityService is connected,
-     * stream volume is immediately forced to 0, proactive mute is applied,
-     * and operational protection becomes active.
+     * stream volume is immediately forced to 0 and operational protection becomes active.
      */
     @Test
     fun test1_enableGuardForcesVolumeZeroAndActivatesOperationalState() {
@@ -72,11 +72,11 @@ class VolumeGuardTest {
      * Physical Volume Up while Guard is active:
      * - Must return FALSE so Android processes Volume Up normally to raise volume.
      * - Must immediately disengage Guard (desired = OFF, operational = OFF).
-     * - Must lift proactive mute so volume up raises audio.
      * - Must persist OFF state.
+     * - Must NOT make any audio IPC calls (leaves volume untouched for Android to raise).
      */
     @Test
-    fun test2_serviceOnKeyEventVolumeUpReturnsFalseAndDisengagesGuard() {
+    fun test2_serviceOnKeyEventVolumeUpReturnsFalseAndDisengagesGuardWithoutAudioIpc() {
         guardManager.setDesiredGuardEnabled(context, true)
         assertTrue(guardManager.isOperationalActive.value)
 
@@ -95,7 +95,7 @@ class VolumeGuardTest {
      * Physical Volume Down while Guard is active:
      * - Must return TRUE so the system volume panel and work are consumed.
      * - Must keep Guard ON and operational.
-     * - Avoids audio IPC when volume is already known to be 0.
+     * - When volume is already 0, avoids redundant setStreamVolume calls.
      */
     @Test
     fun test3_serviceOnKeyEventVolumeDownReturnsTrueAndMaintainsZero() {
@@ -112,10 +112,9 @@ class VolumeGuardTest {
     }
 
     /**
-     * Test 4 — Service Disconnect Lifts Mute & Deactivates Protection:
+     * Test 4 — Service Disconnect:
      * When AccessibilityService disconnects:
      * - Operational protection must immediately become INACTIVE.
-     * - Proactive mute is lifted so device audio behaves normally.
      * - User's desired ON preference is PRESERVED for reconnection.
      */
     @Test
@@ -137,7 +136,7 @@ class VolumeGuardTest {
      * Test 5 — Service Reconnect Restoration:
      * When AccessibilityService reconnects after reboot or process death:
      * - Automatically loads persisted ON preference.
-     * - Immediately applies proactive mute and sets volume to 0.
+     * - Immediately clamps volume to 0.
      * - Becomes operationally active without needing Activity interaction.
      */
     @Test
@@ -183,7 +182,7 @@ class VolumeGuardTest {
     /**
      * Test 7 — Optimized Reactive Receiver Path (Uses Broadcast Extras Directly):
      * When Guard is active and VOLUME_CHANGED_ACTION broadcast is received with STREAM_MUSIC
-     * and a volume > 0, it clamps volume to 0 immediately.
+     * and a volume > 0, it clamps volume to 0 immediately without calling getStreamVolume().
      */
     @Test
     fun test7_reactiveReceiverUsesExtrasDirectlyToClampVolume() {
@@ -297,30 +296,11 @@ class VolumeGuardTest {
     }
 
     /**
-     * Test 13 — Fallback ContentObserver Path:
-     * When ContentObserver detects volume settings write, it invokes reactive correction to 0.
+     * Test 13 — Monitors Active Only When Operational:
+     * Verifies that fast operational flag and monitor are deactivated when Guard is toggled OFF.
      */
     @Test
-    fun test13_contentObserverTriggersImmediateCorrection() {
-        guardManager.setDesiredGuardEnabled(context, true)
-        assertEquals(0, audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
-
-        // Another app changes volume
-        audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, 7, 0)
-
-        // ContentObserver fires
-        val observer = VolumeContentObserver(context)
-        observer.onChange(false, null)
-
-        assertEquals("Media volume must be corrected back to 0", 0, audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
-    }
-
-    /**
-     * Test 14 — Monitors Active Only When Operational:
-     * Verifies that fast operational flag and monitors are deactivated when Guard is toggled OFF.
-     */
-    @Test
-    fun test14_monitorsAreActiveOnlyWhenOperational() {
+    fun test13_monitorsAreActiveOnlyWhenOperational() {
         guardManager.setDesiredGuardEnabled(context, true)
         assertTrue(service.isOperationalFast)
 
