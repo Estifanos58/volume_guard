@@ -13,11 +13,9 @@ import kotlinx.coroutines.flow.asStateFlow
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Interface for registering and unregistering reactive volume monitors on demand.
- * This avoids strong references to the AccessibilityService and prevents memory leaks.
  */
 fun interface VolumeMonitorController {
     fun setMonitorsActive(active: Boolean)
@@ -26,16 +24,12 @@ fun interface VolumeMonitorController {
 /**
  * Centralized, thread-safe coordinator for Volume Guard state and actions.
  *
- * Core Architectural Rules:
- * 1. Desired State vs. Operational State:
- *    - [desiredGuardEnabled]: User preference persisted in SharedPreferences.
- *    - [isServiceConnected]: Hardware AccessibilityService connection status.
- *    - [isOperationalActive]: True ONLY when desiredGuardEnabled == true AND isServiceConnected == true.
- * 2. Never claim hardware protection is active when AccessibilityService is disconnected.
- * 3. Reactive monitors (broadcast receiver, content observer, audio playback callback)
- *    are active ONLY when isOperationalActive == true.
- * 4. Target volume is strictly 0. No previous or initial volume is ever tracked or restored.
- * 5. Diagnostic logging is enabled exclusively in debug builds ([BuildConfig.DEBUG]).
+ * Latency & Resource Optimizations:
+ * 1. [lastKnownMediaVolume]: Thread-safe volatile cache avoiding unnecessary getStreamVolume()
+ *    or setStreamVolume() calls during physical Volume Down presses.
+ * 2. Removed `isSelfAdjustingVolume` lock: Broadcasts with volume == 0 are naturally no-ops.
+ * 3. Single `setStreamVolume(STREAM_MUSIC, 0, 0)` call without redundant explicit mute.
+ * 4. Asynchronous/non-blocking monitor cleanup on physical Volume Up.
  */
 class GuardManager private constructor() {
 
@@ -57,21 +51,22 @@ class GuardManager private constructor() {
     private val _recentLogs = MutableStateFlow<List<String>>(emptyList())
     val recentLogs: StateFlow<List<String>> = _recentLogs.asStateFlow()
 
-    // Flag to prevent recursive loops when our own setStreamVolume triggers system callbacks
-    private val isSelfAdjustingVolume = AtomicBoolean(false)
+    // Volatile cached media volume for O(1) checks without Binder IPC
+    @Volatile
+    var lastKnownMediaVolume: Int = 0
+        private set
 
     @Volatile
     private var monitorController: VolumeMonitorController? = null
 
-    /**
-     * Initializes state from preferences and system audio service.
-     */
     @Synchronized
     fun initialize(context: Context) {
         val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
         if (audioManager != null) {
             _maxMediaVolume.value = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-            _currentMediaVolume.value = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+            val current = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+            _currentMediaVolume.value = current
+            lastKnownMediaVolume = current
         }
 
         val prefs = GuardPreferences.getInstance(context)
@@ -79,9 +74,6 @@ class GuardManager private constructor() {
         updateOperationalState(context)
     }
 
-    /**
-     * Called when the AccessibilityService connects.
-     */
     @Synchronized
     fun onServiceConnected(context: Context, controller: VolumeMonitorController) {
         monitorController = controller
@@ -100,9 +92,6 @@ class GuardManager private constructor() {
         }
     }
 
-    /**
-     * Called when the AccessibilityService disconnects or unbinds.
-     */
     @Synchronized
     fun onServiceDisconnected() {
         if (BuildConfig.DEBUG) {
@@ -114,9 +103,6 @@ class GuardManager private constructor() {
         updateOperationalState(null)
     }
 
-    /**
-     * Sets the user's desired guard state.
-     */
     @Synchronized
     fun setDesiredGuardEnabled(context: Context, enabled: Boolean) {
         _desiredGuardEnabled.value = enabled
@@ -130,78 +116,68 @@ class GuardManager private constructor() {
         if (enabled && _isOperationalActive.value) {
             forceMediaVolumeZero(context, reason = "Guard activated by user")
         }
-        // If disabled: volume remains whatever it is at this instant (do NOT restore or modify)
     }
 
     /**
      * Ultra-fast hot-path handler for physical Volume Up key event.
-     *
-     * Rules:
-     * 1. Detect Volume Up.
-     * 2. Set desired guard = OFF immediately.
-     * 3. Update persistent state.
-     * 4. Deactivate operational protection and monitors.
-     * 5. Do NOT programmatically modify volume.
-     * 6. Caller returns false so Android receives and processes Volume Up normally.
+     * Disengages guard immediately, updates persistent state, and returns without audio IPCs.
      */
     fun onPhysicalVolumeUpFast(context: Context) {
         _desiredGuardEnabled.value = false
         _isOperationalActive.value = false
-        monitorController?.setMonitorsActive(false)
+        lastKnownMediaVolume = 0
         GuardPreferences.getInstance(context).isGuardEnabled = false
         if (BuildConfig.DEBUG) {
-            logDebug("Physical Volume Up intercepted -> Disengaged guard")
+            logDebug("Physical Volume Up -> Disengaged guard")
         }
     }
 
     /**
      * Ultra-fast hot-path handler for physical Volume Down key event.
-     *
-     * Rules:
-     * 1. Keep Guard ON.
-     * 2. Enforce volume remains 0.
-     * 3. Caller consumes event (returns true).
+     * Avoids audio Binder call if volume is already known to be 0.
      */
     fun onPhysicalVolumeDownFast(context: Context) {
-        forceMediaVolumeZero(context, reason = "Physical Volume Down pressed")
+        if (lastKnownMediaVolume > 0) {
+            forceMediaVolumeZero(context, reason = "Physical Volume Down nonzero correction")
+        }
+        // If lastKnownMediaVolume == 0: ZERO audio IPC, immediately return true
     }
 
     /**
-     * Called by reactive volume monitors (broadcast receiver, content observer,
-     * or playback callback) when a media volume change is observed.
+     * Primary reactive volume-change handler.
+     * Called when a volume increase is reported by the broadcast receiver or fallback observer.
      */
-    fun onExternalVolumeChanged(context: Context, newVolume: Int) {
+    fun onMusicVolumeIncreaseDetected(context: Context, newVolume: Int) {
+        lastKnownMediaVolume = newVolume
         _currentMediaVolume.value = newVolume
-        if (isSelfAdjustingVolume.get()) {
-            return
-        }
-
         if (_isOperationalActive.value && newVolume > 0) {
             if (BuildConfig.DEBUG) {
-                logDebug("Reactive volume change detected ($newVolume) -> Clamping to 0")
+                logDebug("Reactive volume increase ($newVolume) -> Clamping to 0")
             }
-            forceMediaVolumeZero(context, reason = "Reactive external correction")
+            forceMediaVolumeZero(context, reason = "Reactive correction ($newVolume -> 0)")
         }
     }
 
     /**
-     * Forces AudioManager.STREAM_MUSIC to volume 0 and applies stream mute.
+     * Updates the volatile cached volume without performing any audio IPC.
+     */
+    fun updateCachedVolume(volume: Int) {
+        lastKnownMediaVolume = volume
+        _currentMediaVolume.value = volume
+    }
+
+    /**
+     * Forces AudioManager.STREAM_MUSIC to volume 0 using a single setStreamVolume call.
      */
     fun forceMediaVolumeZero(context: Context, reason: String = "") {
         val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
         try {
-            isSelfAdjustingVolume.set(true)
             audioManager.setStreamVolume(
                 AudioManager.STREAM_MUSIC,
                 0,
                 0 // 0 flags: no UI slider popup
             )
-            // Extra OEM reinforcement: apply stream mute flag if supported
-            audioManager.adjustStreamVolume(
-                AudioManager.STREAM_MUSIC,
-                AudioManager.ADJUST_MUTE,
-                0
-            )
+            lastKnownMediaVolume = 0
             _currentMediaVolume.value = 0
             if (BuildConfig.DEBUG && reason.isNotEmpty()) {
                 logDebug("Volume 0 enforced ($reason)")
@@ -210,23 +186,19 @@ class GuardManager private constructor() {
             if (BuildConfig.DEBUG) {
                 Log.e(TAG, "Error setting stream volume to 0", e)
             }
-        } finally {
-            isSelfAdjustingVolume.set(false)
         }
     }
 
     fun syncSystemVolume(context: Context) {
         val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
         val vol = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+        lastKnownMediaVolume = vol
         _currentMediaVolume.value = vol
         if (_isOperationalActive.value && vol > 0) {
             forceMediaVolumeZero(context, reason = "Sync check violation")
         }
     }
 
-    /**
-     * Checks if the Accessibility Service is configured in system settings.
-     */
     fun isAccessibilityServiceEnabledInSettings(context: Context): Boolean {
         if (_isServiceConnected.value) return true
 
@@ -262,7 +234,7 @@ class GuardManager private constructor() {
         if (previousState != newState) {
             monitorController?.setMonitorsActive(newState)
             if (BuildConfig.DEBUG) {
-                logDebug("Operational protection active: $newState (desired=${_desiredGuardEnabled.value}, connected=${_isServiceConnected.value})")
+                logDebug("Operational protection: $newState (desired=${_desiredGuardEnabled.value}, connected=${_isServiceConnected.value})")
             }
         }
     }

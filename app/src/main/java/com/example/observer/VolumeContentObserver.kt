@@ -12,8 +12,8 @@ import com.example.core.GuardManager
  * Narrowly scoped System Settings ContentObserver for media volume.
  *
  * Scoped strictly to media volume URIs (e.g. "volume_music_speaker", "volume_music").
- * Does not observe unrelated system settings like brightness, wallpaper, or screen timeout.
- * Provides interrupt-driven fallback for OEM devices (like Tecno/HiOS) without polling.
+ * Operates as a secondary fallback to the primary VOLUME_CHANGED_ACTION broadcast.
+ * Bails out immediately if volume is already zero or protection is inactive.
  */
 class VolumeContentObserver(
     private val context: Context,
@@ -24,8 +24,15 @@ class VolumeContentObserver(
 
     override fun onChange(selfChange: Boolean, uri: Uri?) {
         super.onChange(selfChange, uri)
+        val guardManager = GuardManager.instance
+        if (!guardManager.isOperationalActive.value) return
+
         val am = audioManager ?: return
         val currentVol = am.getStreamVolume(AudioManager.STREAM_MUSIC)
-        GuardManager.instance.onExternalVolumeChanged(context, currentVol)
+        if (currentVol > 0) {
+            guardManager.onMusicVolumeIncreaseDetected(context, currentVol)
+        } else {
+            guardManager.updateCachedVolume(0)
+        }
     }
 }

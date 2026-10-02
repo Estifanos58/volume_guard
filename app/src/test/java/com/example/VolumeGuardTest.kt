@@ -63,6 +63,7 @@ class VolumeGuardTest {
         assertTrue("Protection must be operational", guardManager.isOperationalActive.value)
         assertTrue("Fast hot-path flag must be true", service.isOperationalFast)
         assertEquals("Volume must be immediately forced to 0", 0, audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
+        assertEquals("Cached volume must be 0", 0, guardManager.lastKnownMediaVolume)
     }
 
     /**
@@ -93,12 +94,13 @@ class VolumeGuardTest {
      * Physical Volume Down while Guard is active:
      * - Must return TRUE so the system volume panel and work are consumed.
      * - Must keep Guard ON and operational.
-     * - Must ensure volume remains 0.
+     * - When volume is already 0, avoids redundant setStreamVolume calls.
      */
     @Test
     fun test3_serviceOnKeyEventVolumeDownReturnsTrueAndMaintainsZero() {
         guardManager.setDesiredGuardEnabled(context, true)
         assertTrue(guardManager.isOperationalActive.value)
+        assertEquals(0, guardManager.lastKnownMediaVolume)
 
         val volumeDownEvent = KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_VOLUME_DOWN)
         val consumed = service.onKeyEvent(volumeDownEvent)
@@ -178,32 +180,73 @@ class VolumeGuardTest {
     }
 
     /**
-     * Test 7 — Reactive Receiver Path:
-     * When Guard is active and a rogue app triggers an external volume change broadcast,
-     * VolumeChangeReceiver immediately clamps volume back to 0.
+     * Test 7 — Optimized Reactive Receiver Path (Uses Broadcast Extras Directly):
+     * When Guard is active and VOLUME_CHANGED_ACTION broadcast is received with STREAM_MUSIC
+     * and a volume > 0, it clamps volume to 0 immediately.
      */
     @Test
-    fun test7_reactiveReceiverClampsExternalVolumeToZero() {
+    fun test7_reactiveReceiverUsesExtrasDirectlyToClampVolume() {
         guardManager.setDesiredGuardEnabled(context, true)
         assertEquals(0, audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
 
-        // Rogue app raises volume
+        // Simulate rogue app raising volume in audioManager
         audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, 12, 0)
 
-        // Broadcast received
+        // Broadcast with STREAM_MUSIC and volume = 12
         val receiver = VolumeChangeReceiver()
-        val intent = Intent(VolumeChangeReceiver.VOLUME_CHANGED_ACTION)
+        val intent = Intent(VolumeChangeReceiver.VOLUME_CHANGED_ACTION).apply {
+            putExtra(VolumeChangeReceiver.EXTRA_VOLUME_STREAM_TYPE, AudioManager.STREAM_MUSIC)
+            putExtra(VolumeChangeReceiver.EXTRA_VOLUME_STREAM_VALUE, 12)
+        }
         receiver.onReceive(context, intent)
 
         assertEquals("Media volume must be immediately corrected to 0", 0, audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
+        assertEquals("Cached volume must be updated to 0", 0, guardManager.lastKnownMediaVolume)
     }
 
     /**
-     * Test 8 — Rapid Volume Up events are safe/idempotent:
+     * Test 8 — Zero-Volume Broadcast Causes No Correction / No IPC:
+     * When broadcast reports volume = 0, no correction is triggered.
+     */
+    @Test
+    fun test8_zeroVolumeBroadcastCausesNoCorrection() {
+        guardManager.setDesiredGuardEnabled(context, true)
+        assertEquals(0, audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
+
+        val receiver = VolumeChangeReceiver()
+        val intent = Intent(VolumeChangeReceiver.VOLUME_CHANGED_ACTION).apply {
+            putExtra(VolumeChangeReceiver.EXTRA_VOLUME_STREAM_TYPE, AudioManager.STREAM_MUSIC)
+            putExtra(VolumeChangeReceiver.EXTRA_VOLUME_STREAM_VALUE, 0)
+        }
+        receiver.onReceive(context, intent)
+
+        assertEquals(0, audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
+    }
+
+    /**
+     * Test 9 — Unrelated Stream Broadcasts Are Ignored:
+     * Broadcasts for STREAM_RING or STREAM_ALARM must not trigger STREAM_MUSIC changes.
+     */
+    @Test
+    fun test9_unrelatedStreamBroadcastsIgnored() {
+        guardManager.setDesiredGuardEnabled(context, true)
+
+        val receiver = VolumeChangeReceiver()
+        val ringIntent = Intent(VolumeChangeReceiver.VOLUME_CHANGED_ACTION).apply {
+            putExtra(VolumeChangeReceiver.EXTRA_VOLUME_STREAM_TYPE, AudioManager.STREAM_RING)
+            putExtra(VolumeChangeReceiver.EXTRA_VOLUME_STREAM_VALUE, 5)
+        }
+        receiver.onReceive(context, ringIntent)
+
+        assertEquals(0, audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
+    }
+
+    /**
+     * Test 10 — Rapid Volume Up events are safe/idempotent:
      * Multiple rapid Volume Up events must not crash or cause inconsistent state.
      */
     @Test
-    fun test8_rapidVolumeUpEventsAreSafeAndIdempotent() {
+    fun test10_rapidVolumeUpEventsAreSafeAndIdempotent() {
         guardManager.setDesiredGuardEnabled(context, true)
         assertTrue(guardManager.isOperationalActive.value)
 
@@ -218,11 +261,11 @@ class VolumeGuardTest {
     }
 
     /**
-     * Test 9 — No Initial/Previous Volume Persistence:
+     * Test 11 — No Initial/Previous Volume Persistence:
      * Verify that GuardPreferences only stores a boolean and never tracks or restores previous volume.
      */
     @Test
-    fun test9_noInitialVolumeStorageOrRestoration() {
+    fun test11_noInitialVolumeStorageOrRestoration() {
         audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, 9, 0)
 
         // Enable guard
@@ -237,11 +280,11 @@ class VolumeGuardTest {
     }
 
     /**
-     * Test 10 — Narrowly Scoped ContentObserver Path:
+     * Test 12 — Fallback ContentObserver Path:
      * When ContentObserver detects volume settings write, it invokes reactive correction to 0.
      */
     @Test
-    fun test10_contentObserverTriggersImmediateCorrection() {
+    fun test12_contentObserverTriggersImmediateCorrection() {
         guardManager.setDesiredGuardEnabled(context, true)
         assertEquals(0, audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
 
@@ -256,11 +299,11 @@ class VolumeGuardTest {
     }
 
     /**
-     * Test 11 — Monitors Active Only When Operational:
+     * Test 13 — Monitors Active Only When Operational:
      * Verifies that fast operational flag and monitors are deactivated when Guard is toggled OFF.
      */
     @Test
-    fun test11_monitorsAreActiveOnlyWhenOperational() {
+    fun test13_monitorsAreActiveOnlyWhenOperational() {
         guardManager.setDesiredGuardEnabled(context, true)
         assertTrue(service.isOperationalFast)
 
