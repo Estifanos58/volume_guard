@@ -278,22 +278,22 @@ class VolumeGuardTest {
     }
 
     /**
-     * Test 12 — Adaptive Safety Sampler Activation / Deactivation:
-     * Verifies that adaptive sampler activates when music is playing and stops when music stops.
+     * Test 12 — Rapid Volume Up events are safe/idempotent:
+     * Multiple rapid Volume Up events must not crash or cause inconsistent state.
      */
     @Test
-    fun test12_adaptiveSamplerActiveOnlyDuringMusicPlayback() {
+    fun test12_rapidVolumeUpEventsAreSafeAndIdempotent() {
         guardManager.setDesiredGuardEnabled(context, true)
-        assertTrue(service.isOperationalFast)
-        assertFalse("Initially music not playing", service.isMusicPlaying)
+        assertTrue(guardManager.isOperationalActive.value)
 
-        // Music playback starts
-        service.updatePlaybackState(true)
-        assertTrue("Music playing state is true", service.isMusicPlaying)
+        val event = KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_VOLUME_UP)
+        repeat(5) {
+            val consumed = service.onKeyEvent(event)
+            assertFalse(consumed)
+        }
 
-        // Music playback stops
-        service.updatePlaybackState(false)
-        assertFalse("Music playing state is false", service.isMusicPlaying)
+        assertFalse(guardManager.desiredGuardEnabled.value)
+        assertFalse(guardManager.isOperationalActive.value)
     }
 
     /**

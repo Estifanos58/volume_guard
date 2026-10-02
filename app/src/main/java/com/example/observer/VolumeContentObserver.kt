@@ -13,7 +13,7 @@ import com.example.core.GuardManager
 /**
  * Narrowly scoped System Settings ContentObserver for media volume.
  *
- * Runs on the dedicated monitor HandlerThread to avoid main looper latency.
+ * Runs on the dedicated monitor HandlerThread.
  * Scoped strictly to media volume URIs (e.g. "volume_music_speaker", "volume_music").
  * Operates as a secondary interrupt-driven fallback to the primary VOLUME_CHANGED_ACTION broadcast.
  * Bails out immediately if volume is already zero or protection is inactive.
@@ -35,7 +35,7 @@ class VolumeContentObserver(
         val currentVol = am.getStreamVolume(AudioManager.STREAM_MUSIC)
         if (currentVol > 0) {
             if (BuildConfig.DEBUG) {
-                Log.d(TAG, "ContentObserver caught volume change ($currentVol) -> clamping to 0")
+                Log.d(TAG, "[observer] Caught volume change ($currentVol) -> clamping to 0")
             }
             guardManager.onMusicVolumeIncreaseDetected(context, currentVol, detector = "observer")
         } else {

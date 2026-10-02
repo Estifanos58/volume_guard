@@ -7,13 +7,12 @@
     android:gravity="top|center_horizontal"
     android:background="?android:attr/colorBackground">
 
-    <!-- App Title & Subtitle -->
     <TextView
         android:id="@+id/text_app_title"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:text="@string/app_name"
-        android:textSize="26sp"
+        android:textSize="24sp"
         android:textStyle="bold"
         android:textColor="?android:attr/textColorPrimary"
         android:layout_marginTop="32dp" />
@@ -22,13 +21,12 @@
         android:id="@+id/text_app_subtitle"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:text="STREAM_MUSIC Zero-Lock Protection"
-        android:textSize="14sp"
+        android:text="STREAM_MUSIC Zero-Lock"
+        android:textSize="13sp"
         android:textColor="?android:attr/textColorSecondary"
         android:layout_marginTop="4dp"
         android:layout_marginBottom="32dp" />
 
-    <!-- Main Guard Control Card -->
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
@@ -44,30 +42,14 @@
             android:orientation="horizontal"
             android:gravity="center_vertical">
 
-            <LinearLayout
+            <TextView
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
-                android:orientation="vertical">
-
-                <TextView
-                    android:id="@+id/text_guard_switch_label"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="Volume Guard"
-                    android:textSize="18sp"
-                    android:textStyle="bold"
-                    android:textColor="?android:attr/textColorPrimary" />
-
-                <TextView
-                    android:id="@+id/text_guard_switch_desc"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="Force media volume to 0"
-                    android:textSize="13sp"
-                    android:textColor="?android:attr/textColorSecondary"
-                    android:layout_marginTop="2dp" />
-            </LinearLayout>
+                android:text="Volume Guard"
+                android:textSize="18sp"
+                android:textStyle="bold"
+                android:textColor="?android:attr/textColorPrimary" />
 
             <Switch
                 android:id="@+id/switch_guard"
@@ -84,17 +66,6 @@
             android:layout_marginTop="16dp"
             android:layout_marginBottom="16dp" />
 
-        <!-- Operational Status Indicator -->
-        <TextView
-            android:id="@+id/text_status_label"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="STATUS"
-            android:textSize="11sp"
-            android:textStyle="bold"
-            android:letterSpacing="0.08"
-            android:textColor="?android:attr/textColorSecondary" />
-
         <TextView
             android:id="@+id/text_operational_status"
             android:layout_width="wrap_content"
@@ -102,20 +73,18 @@
             android:text="GUARD OFF"
             android:textSize="16sp"
             android:textStyle="bold"
-            android:textColor="?android:attr/textColorSecondary"
-            android:layout_marginTop="4dp" />
+            android:textColor="?android:attr/textColorSecondary" />
 
         <TextView
             android:id="@+id/text_current_volume"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="Media Volume: 0 / 15"
+            android:text="Media Volume: 0"
             android:textSize="13sp"
             android:textColor="?android:attr/textColorSecondary"
-            android:layout_marginTop="8dp" />
+            android:layout_marginTop="6dp" />
     </LinearLayout>
 
-    <!-- Settings Warning Button (visible when service is not connected) -->
     <Button
         android:id="@+id/button_open_settings"
         android:layout_width="match_parent"
@@ -123,17 +92,6 @@
         android:text="Enable Accessibility Service"
         android:textSize="15sp"
         android:minHeight="48dp"
-        android:visibility="gone"
-        android:layout_marginBottom="16dp" />
-
-    <TextView
-        android:id="@+id/text_hint"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="• Physical Volume Up immediately disables Guard.\n• Physical Volume Down enforces volume 0.\n• External volume increases are clamped within milliseconds."
-        android:textSize="13sp"
-        android:textColor="?android:attr/textColorSecondary"
-        android:lineSpacingExtra="4dp"
-        android:layout_marginTop="8dp" />
+        android:visibility="gone" />
 
 </LinearLayout>

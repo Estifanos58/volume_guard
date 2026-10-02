@@ -20,12 +20,11 @@ import kotlinx.coroutines.launch
 /**
  * Main Activity for Volume Guard.
  *
- * Minimal, ultra-lightweight native Android View interface:
- * - App title & controls with zero Compose overhead.
+ * Minimal native View interface:
  * - Guard toggle switch.
- * - Clear operational status indicator.
- * - Current media volume readout.
- * - Accessibility Settings button when service is not connected.
+ * - Concise operational/service status.
+ * - Current media volume.
+ * - Accessibility Settings button when service is unavailable.
  */
 class MainActivity : ComponentActivity() {
 
@@ -41,24 +40,20 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         setContentView(R.layout.activity_main)
 
-        // Find views
         switchGuard = findViewById(R.id.switch_guard)
         textStatus = findViewById(R.id.text_operational_status)
         textVolume = findViewById(R.id.text_current_volume)
         buttonSettings = findViewById(R.id.button_open_settings)
 
-        // Initialize GuardManager
         val guardManager = GuardManager.instance
         guardManager.initialize(this)
 
-        // Switch toggle listener
         switchGuard.setOnCheckedChangeListener { _, isChecked ->
             if (!isUpdatingSwitchProgrammatically) {
                 guardManager.setDesiredGuardEnabled(this, isChecked)
             }
         }
 
-        // Accessibility settings button listener
         buttonSettings.setOnClickListener {
             val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).apply {
                 flags = Intent.FLAG_ACTIVITY_NEW_TASK
@@ -66,7 +61,6 @@ class MainActivity : ComponentActivity() {
             startActivity(intent)
         }
 
-        // Observe reactive StateFlows using lifecycleScope
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
                 launch {
@@ -90,17 +84,17 @@ class MainActivity : ComponentActivity() {
                         when {
                             operational -> {
                                 textStatus.text = "PROTECTED (Active)"
-                                textStatus.setTextColor(Color.parseColor("#4CAF50")) // Green
+                                textStatus.setTextColor(Color.parseColor("#4CAF50"))
                                 buttonSettings.visibility = View.GONE
                             }
                             !connected -> {
                                 textStatus.text = "SERVICE DISCONNECTED"
-                                textStatus.setTextColor(Color.parseColor("#FF9800")) // Orange
+                                textStatus.setTextColor(Color.parseColor("#FF9800"))
                                 buttonSettings.visibility = View.VISIBLE
                             }
                             !desired -> {
                                 textStatus.text = "GUARD OFF"
-                                textStatus.setTextColor(Color.parseColor("#9E9E9E")) // Grey
+                                textStatus.setTextColor(Color.parseColor("#9E9E9E"))
                                 buttonSettings.visibility = View.GONE
                             }
                         }
@@ -108,13 +102,8 @@ class MainActivity : ComponentActivity() {
                 }
 
                 launch {
-                    combine(
-                        guardManager.currentMediaVolume,
-                        guardManager.maxMediaVolume
-                    ) { current, max ->
-                        Pair(current, max)
-                    }.collect { (current, max) ->
-                        textVolume.text = "Media Volume: $current / $max"
+                    guardManager.currentMediaVolume.collect { current ->
+                        textVolume.text = "Media Volume: $current"
                     }
                 }
             }

@@ -6,7 +6,6 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.media.AudioManager
-import android.media.AudioPlaybackConfiguration
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
@@ -23,31 +22,22 @@ import com.example.receiver.VolumeChangeReceiver
 
 /**
  * Ultra-low latency Accessibility Service responsible for physical volume-key filtering
- * and multi-layered reactive audio volume enforcement.
+ * and deterministic multi-channel reactive volume protection.
  *
- * Latency & Resource Architecture:
- * 1. Physical Key Hot Path:
- *    - Uses [@Volatile isOperationalFast] for O(1) decision making with ZERO allocations.
- *    - Volume Up (Override): Sets local flag OFF, transitions desired state OFF,
- *      schedules monitor/sampler cleanup asynchronously, and returns FALSE with ZERO audio IPC.
- *    - Volume Down: Consumed with TRUE. Performs ZERO audio IPC when cached volume is already 0.
- * 2. Dedicated Single Monitor Thread:
- *    - Single background [HandlerThread] with [Process.THREAD_PRIORITY_AUDIO].
- * 3. Multi-Layered Reactive Protection:
- *    - Primary: [VolumeChangeReceiver] for VOLUME_CHANGED_ACTION (instant extras reading).
- *    - Fallback: [VolumeContentObserver] scoped strictly to media volume setting URIs.
- *    - Adaptive Safety Sampler: Reusable [samplerRunnable] running at 20ms intervals
- *      STRICTLY while Guard is operational AND media playback is actively running.
- *      When playback stops, the sampler completely idles (0% CPU).
+ * Protection Channels (all on single HandlerThread):
+ * 1. Primary Broadcast: [VolumeChangeReceiver] for instant event extras reading.
+ * 2. Targeted Fallback: [VolumeContentObserver] observing media volume setting URIs.
+ * 3. Continuous 10 ms Safety Sampler: Runs continuously while Guard is operational,
+ *    providing deterministic tens-of-milliseconds recovery regardless of OEM broadcast throttling.
+ *
+ * Hot Path:
+ * - Volume Up: Sets volatile flag false, disengages guard, posts async cleanup, returns false.
+ * - Volume Down: Consumed with true; zero audio Binder calls if volume is already known to be 0.
  */
 class VolumeGuardAccessibilityService : AccessibilityService() {
 
     @Volatile
     var isOperationalFast: Boolean = false
-        private set
-
-    @Volatile
-    var isMusicPlaying: Boolean = false
         private set
 
     private val asyncCleanupHandler = Handler(Looper.getMainLooper())
@@ -56,26 +46,28 @@ class VolumeGuardAccessibilityService : AccessibilityService() {
 
     private var volumeChangeReceiver: VolumeChangeReceiver? = null
     private var volumeContentObserver: VolumeContentObserver? = null
-    private var audioPlaybackCallback: AudioManager.AudioPlaybackCallback? = null
 
+    private var cachedAudioManager: AudioManager? = null
     private var isSamplerScheduled = false
 
-    // Reusable sampler Runnable to avoid per-tick allocations
+    // Reusable continuous 10 ms safety sampler Runnable (zero allocations per tick)
     private val samplerRunnable = object : Runnable {
         override fun run() {
-            if (!isOperationalFast || !isMusicPlaying) {
+            if (!isOperationalFast) {
                 isSamplerScheduled = false
                 return
             }
 
-            val am = GuardManager.instance.audioManager
+            val am = cachedAudioManager
+                ?: GuardManager.instance.audioManager
                 ?: (getSystemService(Context.AUDIO_SERVICE) as? AudioManager)
 
             if (am != null) {
                 val vol = am.getStreamVolume(AudioManager.STREAM_MUSIC)
                 if (vol > 0) {
+                    am.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0)
                     if (BuildConfig.DEBUG) {
-                        Log.d(TAG, "[sampler] Caught volume increase ($vol) -> clamping to 0")
+                        Log.d(TAG, "[sampler] Caught volume increase ($vol) -> clamped to 0")
                     }
                     GuardManager.instance.onMusicVolumeIncreaseDetected(
                         this@VolumeGuardAccessibilityService,
@@ -85,8 +77,8 @@ class VolumeGuardAccessibilityService : AccessibilityService() {
                 }
             }
 
-            // Reschedule next tick if still active
-            if (isOperationalFast && isMusicPlaying) {
+            // Reschedule next tick at 10 ms interval
+            if (isOperationalFast) {
                 monitorHandler?.postDelayed(this, SAMPLER_INTERVAL_MS)
             } else {
                 isSamplerScheduled = false
@@ -99,6 +91,9 @@ class VolumeGuardAccessibilityService : AccessibilityService() {
         if (BuildConfig.DEBUG) {
             Log.d(TAG, "onServiceConnected()")
         }
+
+        cachedAudioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        GuardManager.instance.setAudioManager(cachedAudioManager)
 
         // Configure key filtering capability with minimal footprint
         val info = serviceInfo ?: AccessibilityServiceInfo()
@@ -176,13 +171,15 @@ class VolumeGuardAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * Activates or deactivates monitors and the adaptive sampler dynamically.
+     * Activates or deactivates monitors and the continuous 10 ms safety sampler.
      */
     fun setMonitorsActive(active: Boolean) {
         isOperationalFast = active
         if (active) {
             registerMonitors()
+            startContinuousSampler()
         } else {
+            stopContinuousSampler()
             unregisterMonitors()
         }
     }
@@ -199,7 +196,7 @@ class VolumeGuardAccessibilityService : AccessibilityService() {
 
             val handler = monitorHandler ?: Handler(Looper.getMainLooper())
 
-            // 1. Primary monitor: VOLUME_CHANGED_ACTION broadcast receiver
+            // 1. Primary monitor: VOLUME_CHANGED_ACTION broadcast receiver on background handler
             if (volumeChangeReceiver == null) {
                 volumeChangeReceiver = VolumeChangeReceiver()
                 val filter = IntentFilter(VolumeChangeReceiver.VOLUME_CHANGED_ACTION)
@@ -210,32 +207,20 @@ class VolumeGuardAccessibilityService : AccessibilityService() {
                 }
             }
 
-            // 2. Fallback monitor: Narrowly scoped ContentObserver for music volume settings
+            // 2. Fallback monitor: Narrowly scoped ContentObserver for media volume settings
             if (volumeContentObserver == null) {
                 volumeContentObserver = VolumeContentObserver(this, handler)
-                val musicUri = Settings.System.getUriFor("volume_music_speaker")
-                    ?: Settings.System.getUriFor("volume_music")
-                if (musicUri != null) {
-                    contentResolver.registerContentObserver(musicUri, false, volumeContentObserver!!)
-                } else {
-                    contentResolver.registerContentObserver(Settings.System.CONTENT_URI, false, volumeContentObserver!!)
+                val musicSpeakerUri = Settings.System.getUriFor("volume_music_speaker")
+                val musicUri = Settings.System.getUriFor("volume_music")
+
+                if (musicSpeakerUri != null) {
+                    contentResolver.registerContentObserver(musicSpeakerUri, false, volumeContentObserver!!)
                 }
-            }
-
-            // 3. Playback state detection for the adaptive sampler
-            val am = GuardManager.instance.audioManager ?: (getSystemService(Context.AUDIO_SERVICE) as? AudioManager)
-            if (am != null) {
-                // Check initial playback state
-                updatePlaybackState(am.isMusicActive)
-
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && audioPlaybackCallback == null) {
-                    audioPlaybackCallback = object : AudioManager.AudioPlaybackCallback() {
-                        override fun onPlaybackConfigChanged(configs: List<AudioPlaybackConfiguration>?) {
-                            val playing = !configs.isNullOrEmpty() || am.isMusicActive
-                            updatePlaybackState(playing)
-                        }
-                    }
-                    am.registerAudioPlaybackCallback(audioPlaybackCallback!!, handler)
+                if (musicUri != null && musicUri != musicSpeakerUri) {
+                    contentResolver.registerContentObserver(musicUri, false, volumeContentObserver!!)
+                }
+                if (musicSpeakerUri == null && musicUri == null) {
+                    contentResolver.registerContentObserver(Settings.System.CONTENT_URI, false, volumeContentObserver!!)
                 }
             }
         } catch (e: Exception) {
@@ -247,8 +232,6 @@ class VolumeGuardAccessibilityService : AccessibilityService() {
 
     private fun unregisterMonitors() {
         try {
-            stopSampler()
-
             volumeChangeReceiver?.let {
                 unregisterReceiver(it)
                 volumeChangeReceiver = null
@@ -256,11 +239,6 @@ class VolumeGuardAccessibilityService : AccessibilityService() {
             volumeContentObserver?.let {
                 contentResolver.unregisterContentObserver(it)
                 volumeContentObserver = null
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && audioPlaybackCallback != null) {
-                val am = GuardManager.instance.audioManager ?: (getSystemService(Context.AUDIO_SERVICE) as? AudioManager)
-                audioPlaybackCallback?.let { am?.unregisterAudioPlaybackCallback(it) }
-                audioPlaybackCallback = null
             }
             monitorThread?.quitSafely()
             monitorThread = null
@@ -272,23 +250,14 @@ class VolumeGuardAccessibilityService : AccessibilityService() {
         }
     }
 
-    fun updatePlaybackState(playing: Boolean) {
-        isMusicPlaying = playing
-        if (isOperationalFast && isMusicPlaying) {
-            startSamplerIfNeeded()
-        } else {
-            stopSampler()
-        }
-    }
-
-    private fun startSamplerIfNeeded() {
-        if (!isSamplerScheduled && isOperationalFast && isMusicPlaying) {
+    private fun startContinuousSampler() {
+        if (!isSamplerScheduled && isOperationalFast) {
             isSamplerScheduled = true
             monitorHandler?.post(samplerRunnable)
         }
     }
 
-    private fun stopSampler() {
+    private fun stopContinuousSampler() {
         isSamplerScheduled = false
         monitorHandler?.removeCallbacks(samplerRunnable)
     }
@@ -297,9 +266,9 @@ class VolumeGuardAccessibilityService : AccessibilityService() {
         private const val TAG = "VolumeGuardService"
 
         /**
-         * Adaptive safety sampling interval in milliseconds.
-         * Default: 20 ms. Can be tuned to 10 ms if device profiling justifies it.
+         * Continuous safety sampling interval in milliseconds while Guard is operational.
+         * Guarantees volume leaks are caught within 10 ms even under OEM broadcast delays.
          */
-        const val SAMPLER_INTERVAL_MS = 20L
+        const val SAMPLER_INTERVAL_MS = 10L
     }
 }
