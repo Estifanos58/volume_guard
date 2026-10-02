@@ -9,11 +9,11 @@ import android.os.Looper
 import com.example.core.GuardManager
 
 /**
- * System Settings ContentObserver for media volume.
+ * Narrowly scoped System Settings ContentObserver for media volume.
  *
- * Provides a secondary, interrupt-driven safety net in case an OEM ROM (like HiOS on Tecno devices)
- * suppresses or delays system broadcasts. When any component writes to audio settings,
- * the ContentResolver notifies this observer with zero polling overhead.
+ * Scoped strictly to media volume URIs (e.g. "volume_music_speaker", "volume_music").
+ * Does not observe unrelated system settings like brightness, wallpaper, or screen timeout.
+ * Provides interrupt-driven fallback for OEM devices (like Tecno/HiOS) without polling.
  */
 class VolumeContentObserver(
     private val context: Context,
@@ -24,9 +24,8 @@ class VolumeContentObserver(
 
     override fun onChange(selfChange: Boolean, uri: Uri?) {
         super.onChange(selfChange, uri)
-        if (audioManager == null) return
-
-        val currentVol = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+        val am = audioManager ?: return
+        val currentVol = am.getStreamVolume(AudioManager.STREAM_MUSIC)
         GuardManager.instance.onExternalVolumeChanged(context, currentVol)
     }
 }

@@ -5,7 +5,11 @@ import android.accessibilityservice.AccessibilityServiceInfo
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.media.AudioManager
+import android.media.AudioPlaybackConfiguration
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
 import android.util.Log
 import android.view.KeyEvent
@@ -16,32 +20,34 @@ import com.example.observer.VolumeContentObserver
 import com.example.receiver.VolumeChangeReceiver
 
 /**
- * Core Accessibility Service responsible for physical volume-key filtering.
+ * Ultra-low overhead Accessibility Service responsible for physical volume-key filtering.
  *
- * Android Architecture Note:
- * Android allows an AccessibilityService with [flagRequestFilterKeyEvents] to intercept
- * raw hardware key events BEFORE they reach the WindowManager or the AudioService.
- *
- * Rules:
- * 1. Physical Volume Up while Guard is ON:
- *    - Immediately disengages Guard (State -> OFF).
- *    - Returns FALSE so Android continues processing the physical Volume Up normally
- *      and raises the phone's volume.
- *
- * 2. Physical Volume Down while Guard is ON:
- *    - Keeps Guard ON.
+ * Performance and Correctness Optimizations:
+ * 1. [isOperationalFast] volatile boolean ensures onKeyEvent() has O(1) execution with
+ *    zero object allocations, zero string formatting, and zero StateFlow hops on the hot path.
+ * 2. Physical Volume Up (Override):
+ *    - Immediately flips [isOperationalFast] to false.
+ *    - Updates persistent state asynchronously.
+ *    - Returns FALSE so Android continues processing Volume Up normally and raises volume.
+ * 3. Physical Volume Down:
  *    - Enforces volume 0.
- *    - Returns TRUE to consume the event and prevent unnecessary system UI/slider popups.
- *
- * 3. Reactive Volume Monitors:
- *    - Broadcast receiver and ContentObserver are active ONLY while operational protection
- *      is actually ACTIVE. When Guard is OFF or Service is disconnected, all background
- *      monitors are completely unregistered to preserve battery.
+ *    - Returns TRUE to consume the key event and prevent unwanted volume sliders.
+ * 4. Reactive Volume Monitors:
+ *    - Dynamically registered ONLY while operational protection is active.
+ *    - Includes:
+ *      * Hardened VolumeChangeReceiver (queries system AudioManager directly).
+ *      * Narrowly scoped VolumeContentObserver (observed only for media volume URIs).
+ *      * AudioPlaybackCallback (API 26+) catching rogue apps at playback spin-up.
  */
 class VolumeGuardAccessibilityService : AccessibilityService() {
 
+    @Volatile
+    var isOperationalFast: Boolean = false
+        private set
+
     private var volumeChangeReceiver: VolumeChangeReceiver? = null
     private var volumeContentObserver: VolumeContentObserver? = null
+    private var audioPlaybackCallback: AudioManager.AudioPlaybackCallback? = null
 
     public override fun onServiceConnected() {
         super.onServiceConnected()
@@ -49,7 +55,7 @@ class VolumeGuardAccessibilityService : AccessibilityService() {
             Log.d(TAG, "onServiceConnected()")
         }
 
-        // Configure key filtering capability
+        // Configure key filtering capability with minimal footprint
         val info = serviceInfo ?: AccessibilityServiceInfo()
         info.flags = info.flags or AccessibilityServiceInfo.FLAG_REQUEST_FILTER_KEY_EVENTS
         info.feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
@@ -62,38 +68,32 @@ class VolumeGuardAccessibilityService : AccessibilityService() {
     }
 
     public override fun onKeyEvent(event: KeyEvent?): Boolean {
-        if (event == null) return false
-
-        val isOperational = GuardManager.instance.isOperationalActive.value
-        if (!isOperational) {
-            // Normal Android operation when Guard is OFF or not operational
-            return super.onKeyEvent(event)
+        // Hot-path filter: immediately pass through if null or guard is inactive
+        if (event == null || !isOperationalFast) {
+            return false
         }
 
-        return when (event.keyCode) {
-            KeyEvent.KEYCODE_VOLUME_UP -> {
-                // User's intentional emergency/override button
-                if (event.action == KeyEvent.ACTION_DOWN) {
-                    GuardManager.instance.onPhysicalVolumeUp(this)
-                }
-                // CRITICAL: Do NOT consume the Volume Up event.
-                // Return false so Android processes the user's Volume Up normally and raises the volume!
-                false
-            }
+        val keyCode = event.keyCode
 
-            KeyEvent.KEYCODE_VOLUME_DOWN -> {
-                // Volume Down must NOT disable the guard. Volume remains 0.
-                if (event.action == KeyEvent.ACTION_DOWN) {
-                    GuardManager.instance.onPhysicalVolumeDown(this)
-                }
-                // Consume event to prevent unnecessary OS processing since volume is already 0
-                true
+        if (keyCode == KeyEvent.KEYCODE_VOLUME_UP) {
+            if (event.action == KeyEvent.ACTION_DOWN) {
+                // Synchronously disable local fast flag to eliminate latency
+                isOperationalFast = false
+                GuardManager.instance.onPhysicalVolumeUpFast(this)
             }
-
-            else -> {
-                super.onKeyEvent(event)
-            }
+            // CRITICAL: Return false so Android processes physical Volume Up normally
+            return false
         }
+
+        if (keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
+            if (event.action == KeyEvent.ACTION_DOWN) {
+                GuardManager.instance.onPhysicalVolumeDownFast(this)
+            }
+            // Consume physical Volume Down so volume remains 0 and system work is skipped
+            return true
+        }
+
+        return super.onKeyEvent(event)
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -127,7 +127,8 @@ class VolumeGuardAccessibilityService : AccessibilityService() {
     /**
      * Activates or deactivates reactive volume monitors dynamically based on operational state.
      */
-    private fun setMonitorsActive(active: Boolean) {
+    fun setMonitorsActive(active: Boolean) {
+        isOperationalFast = active
         if (active) {
             registerMonitors()
         } else {
@@ -137,6 +138,7 @@ class VolumeGuardAccessibilityService : AccessibilityService() {
 
     private fun registerMonitors() {
         try {
+            // 1. Hardened broadcast receiver for VOLUME_CHANGED_ACTION
             if (volumeChangeReceiver == null) {
                 volumeChangeReceiver = VolumeChangeReceiver()
                 val filter = IntentFilter(VolumeChangeReceiver.VOLUME_CHANGED_ACTION)
@@ -145,25 +147,43 @@ class VolumeGuardAccessibilityService : AccessibilityService() {
                 } else {
                     registerReceiver(volumeChangeReceiver, filter)
                 }
-                if (BuildConfig.DEBUG) {
-                    Log.d(TAG, "VolumeChangeReceiver registered")
+            }
+
+            // 2. Narrowly scoped ContentObserver for music volume settings
+            if (volumeContentObserver == null) {
+                volumeContentObserver = VolumeContentObserver(this)
+                val musicUri = Settings.System.getUriFor("volume_music_speaker")
+                    ?: Settings.System.getUriFor("volume_music")
+                if (musicUri != null) {
+                    contentResolver.registerContentObserver(musicUri, false, volumeContentObserver!!)
+                } else {
+                    contentResolver.registerContentObserver(Settings.System.CONTENT_URI, false, volumeContentObserver!!)
                 }
             }
 
-            if (volumeContentObserver == null) {
-                volumeContentObserver = VolumeContentObserver(this)
-                contentResolver.registerContentObserver(
-                    Settings.System.CONTENT_URI,
-                    true,
-                    volumeContentObserver!!
-                )
-                if (BuildConfig.DEBUG) {
-                    Log.d(TAG, "VolumeContentObserver registered")
+            // 3. AudioPlaybackCallback (API 26+) for reactive media start detection
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && audioPlaybackCallback == null) {
+                val am = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+                if (am != null) {
+                    audioPlaybackCallback = object : AudioManager.AudioPlaybackCallback() {
+                        override fun onPlaybackConfigChanged(configs: List<AudioPlaybackConfiguration>?) {
+                            if (isOperationalFast) {
+                                val currentVol = am.getStreamVolume(AudioManager.STREAM_MUSIC)
+                                if (currentVol > 0) {
+                                    GuardManager.instance.onExternalVolumeChanged(
+                                        this@VolumeGuardAccessibilityService,
+                                        currentVol
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    am.registerAudioPlaybackCallback(audioPlaybackCallback!!, Handler(Looper.getMainLooper()))
                 }
             }
         } catch (e: Exception) {
             if (BuildConfig.DEBUG) {
-                Log.e(TAG, "Failed to register volume monitors", e)
+                Log.e(TAG, "Error registering volume monitors", e)
             }
         }
     }
@@ -173,16 +193,15 @@ class VolumeGuardAccessibilityService : AccessibilityService() {
             volumeChangeReceiver?.let {
                 unregisterReceiver(it)
                 volumeChangeReceiver = null
-                if (BuildConfig.DEBUG) {
-                    Log.d(TAG, "VolumeChangeReceiver unregistered")
-                }
             }
             volumeContentObserver?.let {
                 contentResolver.unregisterContentObserver(it)
                 volumeContentObserver = null
-                if (BuildConfig.DEBUG) {
-                    Log.d(TAG, "VolumeContentObserver unregistered")
-                }
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && audioPlaybackCallback != null) {
+                val am = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+                audioPlaybackCallback?.let { am?.unregisterAudioPlaybackCallback(it) }
+                audioPlaybackCallback = null
             }
         } catch (e: Exception) {
             if (BuildConfig.DEBUG) {

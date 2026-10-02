@@ -32,7 +32,8 @@ fun interface VolumeMonitorController {
  *    - [isServiceConnected]: Hardware AccessibilityService connection status.
  *    - [isOperationalActive]: True ONLY when desiredGuardEnabled == true AND isServiceConnected == true.
  * 2. Never claim hardware protection is active when AccessibilityService is disconnected.
- * 3. Reactive monitors (broadcast receiver & content observer) are active ONLY when isOperationalActive == true.
+ * 3. Reactive monitors (broadcast receiver, content observer, audio playback callback)
+ *    are active ONLY when isOperationalActive == true.
  * 4. Target volume is strictly 0. No previous or initial volume is ever tracked or restored.
  * 5. Diagnostic logging is enabled exclusively in debug builds ([BuildConfig.DEBUG]).
  */
@@ -64,7 +65,6 @@ class GuardManager private constructor() {
 
     /**
      * Initializes state from preferences and system audio service.
-     * Safe to call from Activity onCreate/onResume or Service onServiceConnected.
      */
     @Synchronized
     fun initialize(context: Context) {
@@ -81,7 +81,6 @@ class GuardManager private constructor() {
 
     /**
      * Called when the AccessibilityService connects.
-     * This is the authoritative entry point for service startup and reconnection.
      */
     @Synchronized
     fun onServiceConnected(context: Context, controller: VolumeMonitorController) {
@@ -90,7 +89,9 @@ class GuardManager private constructor() {
 
         val prefs = GuardPreferences.getInstance(context)
         _desiredGuardEnabled.value = prefs.isGuardEnabled
-        logDebug("AccessibilityService connected (desired=$prefs.isGuardEnabled)")
+        if (BuildConfig.DEBUG) {
+            logDebug("AccessibilityService connected (desired=${prefs.isGuardEnabled})")
+        }
 
         updateOperationalState(context)
 
@@ -101,12 +102,12 @@ class GuardManager private constructor() {
 
     /**
      * Called when the AccessibilityService disconnects or unbinds.
-     * Immediately marks operational protection as inactive and stops reactive monitors,
-     * while preserving the user's desired ON/OFF preference for future reconnection.
      */
     @Synchronized
     fun onServiceDisconnected() {
-        logDebug("AccessibilityService disconnected -> operational protection deactivated")
+        if (BuildConfig.DEBUG) {
+            logDebug("AccessibilityService disconnected -> operational protection deactivated")
+        }
         _isServiceConnected.value = false
         monitorController?.setMonitorsActive(false)
         monitorController = null
@@ -120,7 +121,9 @@ class GuardManager private constructor() {
     fun setDesiredGuardEnabled(context: Context, enabled: Boolean) {
         _desiredGuardEnabled.value = enabled
         GuardPreferences.getInstance(context).isGuardEnabled = enabled
-        logDebug("User desired guard changed to $enabled")
+        if (BuildConfig.DEBUG) {
+            logDebug("User desired guard changed to $enabled")
+        }
 
         updateOperationalState(context)
 
@@ -131,7 +134,7 @@ class GuardManager private constructor() {
     }
 
     /**
-     * Called when a physical Volume Up key event is intercepted by AccessibilityService.
+     * Ultra-fast hot-path handler for physical Volume Up key event.
      *
      * Rules:
      * 1. Detect Volume Up.
@@ -141,36 +144,31 @@ class GuardManager private constructor() {
      * 5. Do NOT programmatically modify volume.
      * 6. Caller returns false so Android receives and processes Volume Up normally.
      */
-    @Synchronized
-    fun onPhysicalVolumeUp(context: Context) {
-        if (_isOperationalActive.value) {
-            logDebug("Physical Volume Up intercepted -> Disengaging guard")
-            setDesiredGuardEnabled(context, false)
+    fun onPhysicalVolumeUpFast(context: Context) {
+        _desiredGuardEnabled.value = false
+        _isOperationalActive.value = false
+        monitorController?.setMonitorsActive(false)
+        GuardPreferences.getInstance(context).isGuardEnabled = false
+        if (BuildConfig.DEBUG) {
+            logDebug("Physical Volume Up intercepted -> Disengaged guard")
         }
     }
 
     /**
-     * Called when a physical Volume Down key event is intercepted by AccessibilityService.
+     * Ultra-fast hot-path handler for physical Volume Down key event.
      *
      * Rules:
-     * 1. Detect Volume Down.
-     * 2. Keep Guard ON.
-     * 3. Enforce volume remains 0.
-     * 4. Caller consumes event (returns true) so unnecessary system UI work is skipped.
+     * 1. Keep Guard ON.
+     * 2. Enforce volume remains 0.
+     * 3. Caller consumes event (returns true).
      */
-    @Synchronized
-    fun onPhysicalVolumeDown(context: Context) {
-        if (_isOperationalActive.value) {
-            logDebug("Physical Volume Down intercepted -> Enforcing volume 0")
-            forceMediaVolumeZero(context, reason = "Physical Volume Down pressed")
-        }
+    fun onPhysicalVolumeDownFast(context: Context) {
+        forceMediaVolumeZero(context, reason = "Physical Volume Down pressed")
     }
 
     /**
-     * Called by reactive volume monitors (broadcast receiver or content observer)
-     * when a media volume change is observed.
-     *
-     * Note: This is best-effort reactive correction, NOT a kernel-level pre-veto.
+     * Called by reactive volume monitors (broadcast receiver, content observer,
+     * or playback callback) when a media volume change is observed.
      */
     fun onExternalVolumeChanged(context: Context, newVolume: Int) {
         _currentMediaVolume.value = newVolume
@@ -179,13 +177,15 @@ class GuardManager private constructor() {
         }
 
         if (_isOperationalActive.value && newVolume > 0) {
-            logDebug("Reactive volume change detected ($newVolume) -> Clamping to 0")
+            if (BuildConfig.DEBUG) {
+                logDebug("Reactive volume change detected ($newVolume) -> Clamping to 0")
+            }
             forceMediaVolumeZero(context, reason = "Reactive external correction")
         }
     }
 
     /**
-     * Forces AudioManager.STREAM_MUSIC to volume 0.
+     * Forces AudioManager.STREAM_MUSIC to volume 0 and applies stream mute.
      */
     fun forceMediaVolumeZero(context: Context, reason: String = "") {
         val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
@@ -196,8 +196,14 @@ class GuardManager private constructor() {
                 0,
                 0 // 0 flags: no UI slider popup
             )
+            // Extra OEM reinforcement: apply stream mute flag if supported
+            audioManager.adjustStreamVolume(
+                AudioManager.STREAM_MUSIC,
+                AudioManager.ADJUST_MUTE,
+                0
+            )
             _currentMediaVolume.value = 0
-            if (reason.isNotEmpty()) {
+            if (BuildConfig.DEBUG && reason.isNotEmpty()) {
                 logDebug("Volume 0 enforced ($reason)")
             }
         } catch (e: Exception) {
@@ -255,7 +261,9 @@ class GuardManager private constructor() {
 
         if (previousState != newState) {
             monitorController?.setMonitorsActive(newState)
-            logDebug("Operational protection active: $newState (desired=${_desiredGuardEnabled.value}, connected=${_isServiceConnected.value})")
+            if (BuildConfig.DEBUG) {
+                logDebug("Operational protection active: $newState (desired=${_desiredGuardEnabled.value}, connected=${_isServiceConnected.value})")
+            }
         }
     }
 

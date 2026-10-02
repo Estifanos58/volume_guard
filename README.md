@@ -1,138 +1,111 @@
 # Volume Guard
 
-**Volume Guard** is a lightweight, defensive Android utility designed to mitigate rogue, prank, or malicious applications that attempt to unexpectedly raise media volume to maximum.
+**Volume Guard** is a specialized, zero-overhead defensive Android utility designed to prevent unwanted media volume spikes caused by rogue, prank, or malfunctioning applications.
 
 ---
 
-## 1. What the App Does
+## 1. Core Operational Contract
 
-- **Volume Locking:** When operational protection is active, media volume (`AudioManager.STREAM_MUSIC`) is forced to **0**.
-- **Hardware Button Interception:** Utilizes Android's `AccessibilityService` (`FLAG_REQUEST_FILTER_KEY_EVENTS`) to inspect physical hardware volume keys *before* they are processed by the system window manager:
-  - **Physical Volume Up:** Serves as the user's intentional emergency override. It immediately disables the guard and returns `false` so Android processes the Volume Up event normally and raises the volume.
-  - **Physical Volume Down:** Consumed (`return true`) to prevent unnecessary volume sliders while keeping the guard strictly active and volume locked to 0.
-- **Dynamic Reactive Monitoring:** While protection is operational, listens for system volume broadcasts (`android.media.VOLUME_CHANGED_ACTION`) and system settings updates (`Settings.System.CONTENT_URI`). If an external app changes volume, Volume Guard reactively forces it back to 0.
-- **Resource Efficient:** Reactive monitors are unregistered whenever protection is inactive or the service is disconnected. Zero background polling loops, zero network permissions, zero wake locks.
-
----
-
-## 2. Desired State vs. Operational State
-
-To prevent misleading status displays and race conditions:
-
-1. **User Desired State (`desiredGuardEnabled`):**
-   - The user's persisted preference in `SharedPreferences`.
-   - Preserved across service disconnects and process lifecycles.
-
-2. **Accessibility Service Status (`isServiceConnected`):**
-   - Tracks whether `VolumeGuardAccessibilityService` is actively running and bound by Android.
-
-3. **Operational Protection (`isOperationalActive`):**
-   - Protection is active **ONLY** when:
-     ```text
-     desiredGuardEnabled == true
-     AND
-     isServiceConnected == true
-     ```
-   - If the AccessibilityService disconnects, operational protection is marked **INACTIVE** immediately. The UI clearly reports "Protection Inactive — Accessibility Service Disconnected" and never falsely claims hardware-key protection is active.
-   - When the AccessibilityService reconnects (e.g. after reboot or process restart), it automatically checks the persisted preference and re-establishes volume 0 protection without requiring the Activity to be opened.
+* **Target Volume:** Strictly **`0`** (`AudioManager.STREAM_MUSIC`).
+* **Zero Initial/Previous Volume Storage:** The app never records, remembers, or restores previous volume levels. Disabling the guard leaves volume at whatever value the system currently has.
+* **Guard Active + Physical Volume Up:**
+  - Disengages the guard immediately (desired state -> `OFF`, operational state -> `inactive`).
+  - Does **not** programmatically modify volume.
+  - Returns `false` from `onKeyEvent()` so Android receives the key event and raises volume normally.
+* **Guard Active + Physical Volume Down:**
+  - Keeps the guard active.
+  - Ensures media volume remains `0`.
+  - Returns `true` from `onKeyEvent()` to consume the event and suppress redundant system volume UI.
+* **Guard Inactive:**
+  - Passes all hardware volume keys through untouched (`return false`).
+  - Normal Android volume behavior.
 
 ---
 
-## 3. Physical Volume Button Contract
+## 2. Technical Architecture: Interception vs. Reactive Correction
 
-1. **Guard Active + Physical Volume Up:**
-   - Detects Volume Up key press.
-   - Disables guard immediately (sets user desired state to OFF, updates persistent state).
-   - Does NOT programmatically alter or reset volume.
-   - Returns `false` so Android receives the hardware key event and increases volume normally.
+### A. Physical Hardware Keys: True Pre-Dispatch Interception
+Android allows an accessibility service declaring `flagRequestFilterKeyEvents` and `canRequestFilterKeyEvents="true"` to observe raw hardware key events **before** they are dispatched to the window manager or the audio subsystem.
+- In `VolumeGuardAccessibilityService.onKeyEvent()`, an `@Volatile` flag (`isOperationalFast`) enables O(1) key filtering on the hot path with:
+  - **Zero object allocations**
+  - **Zero logging overhead**
+  - **Zero StateFlow or coroutine hops**
 
-2. **Guard Active + Physical Volume Down:**
-   - Detects Volume Down key press.
-   - Keeps guard active.
-   - Ensures media volume is 0.
-   - Returns `true` to consume the event and suppress redundant system volume UI.
+### B. Programmatic Volume Changes: Best-Effort Reactive Correction
+**Platform Reality on Unrooted Android:**
+- When an application executes `AudioManager.setStreamVolume()`, it communicates directly with `AudioService` via IPC/Binder.
+- **No public API exists for an unrooted third-party app to pre-veto or block another app's IPC call before Android applies it.** Claims of universal preemption on unrooted Android are technically impossible without system signature privileges or root.
+- **Volume Guard's Defensive Response:**
+  Volume Guard implements immediate, interrupt-driven reactive correction active **only while protection is operational**:
+  1. **Hardened `VolumeChangeReceiver`:** Listens for `android.media.VOLUME_CHANGED_ACTION`. Verifies the true hardware volume directly via `AudioManager` (immune to spoofed intent extras) and immediately clamps to `0`. Registered with `Context.RECEIVER_EXPORTED` on API 33+ as required for system broadcasts.
+  2. **Narrowly Scoped `VolumeContentObserver`:** Observes specific media volume setting URIs (`volume_music_speaker`, `volume_music`) rather than the broad `Settings.System.CONTENT_URI`, avoiding spurious wakeups from brightness or screen timeout changes.
+  3. **`AudioPlaybackCallback` (API 26+):** Detects when rogue media tracks spin up and verifies volume is clamped to `0`.
+  4. **Double Enforcement:** Applies both `setStreamVolume(STREAM_MUSIC, 0, 0)` and `adjustStreamVolume(STREAM_MUSIC, ADJUST_MUTE, 0)`.
 
-3. **Guard Inactive:**
-   - Passes all hardware key events through untouched (`return false`).
-   - Normal Android volume behavior.
-
-4. **Zero Volume Target:**
-   - Protected volume is **always 0**.
-   - No initial volume or previous volume is ever recorded or restored.
-   - Disabling the guard leaves volume at whatever level Android currently has at that moment.
-
----
-
-## 4. Platform Limitations & Programmatic Volume Changes
-
-### Realities of Unrooted Android
-On an unrooted, standard Android device:
-- **Hardware Keys:** Preemptable via `AccessibilityService.onKeyEvent()`. Because our service registers `flagRequestFilterKeyEvents`, physical volume buttons are delivered to Volume Guard *before* the window manager or audio service processes them.
-- **Programmatic Volume Changes:** Third-party applications invoke `AudioManager.setStreamVolume()` directly via IPC to the system `AudioService`. On unrooted Android without system signatures or hidden platform privileges, no third-party application can intercept or pre-veto IPC calls made by other applications before they reach `AudioService`.
-
-### Best-Effort Reactive Correction
-Rather than claiming an impossible pre-dispatch veto:
-- Volume Guard dynamically registers a broadcast receiver for `android.media.VOLUME_CHANGED_ACTION` and a `ContentObserver` on `Settings.System.CONTENT_URI` **only while operational protection is active**.
-- When an external application raises volume, Android updates its internal settings; Volume Guard receives this system event and issues an immediate reactive correction (`setStreamVolume(STREAM_MUSIC, 0, 0)`).
-- When protection is inactive, all broadcast receivers and content observers are completely unregistered.
+When the guard is toggled `OFF` or the service disconnects, all three reactive monitors are immediately unregistered, leaving **0% background CPU consumption and zero polling loops**.
 
 ---
 
-## 5. How to Build the APK
+## 3. Desired State vs. Operational State
 
-In Android Studio or from the command line:
+To prevent race conditions, false security indicators, and boot loops:
+
+1. **`desiredGuardEnabled` (User Preference):**
+   - Stored in `SharedPreferences`. Preserved across process restarts, service disconnects, and reboots.
+2. **`isServiceConnected` (Service Lifecycle):**
+   - Tracks live connection status of `VolumeGuardAccessibilityService`.
+3. **`isOperationalActive` (Operational Status):**
+   - Active **only** when `desiredGuardEnabled == true && isServiceConnected == true`.
+   - If the accessibility service disconnects or dies, operational protection is immediately marked **inactive**. The UI warns that the service is disconnected and never falsely displays "Guard Active".
+   - When the service connects or reconnects (e.g. after reboot), it reads the persisted preference and re-establishes volume `0` protection automatically.
+
+---
+
+## 4. Resource Usage & Minimal Dependencies
+
+- **Platform Framework First:** Relies directly on Android system APIs (`AudioManager`, `AccessibilityService`, `BroadcastReceiver`, `ContentObserver`).
+- **Cleaned Dependencies:** Leftover template libraries (Firebase, Google Services, Secrets, Camera, Room, Retrofit, OkHttp) have been completely removed.
+- **Network Permissions:** Strictly **0 network permissions** (`INTERNET` is not requested).
+- **Logging:** All diagnostic logs are gated behind `BuildConfig.DEBUG`. Production release builds emit zero diagnostic log spam.
+
+---
+
+## 5. Tecno / OEM Considerations (e.g. Tecno POP 7)
+
+On devices running custom Android distributions such as Tecno HiOS:
+1. **Aggressive Battery Management:** Custom OS battery managers may stop background accessibility services. Configure **Settings → Battery Lab / Power Management → Volume Guard** to allow unrestricted background activity.
+2. **Accessibility Permission Re-check:** If the OS disables accessibility after prolonged idle time, Volume Guard detects this on activity resume and prompts the user to re-enable it.
+3. **Volume Sliders:** Consuming `KEYCODE_VOLUME_DOWN` (`return true`) successfully suppresses the on-screen HiOS volume slider popup.
+
+---
+
+## 6. How to Build & Install
 
 ```bash
 # Build the debug APK:
 gradle assembleDebug
 
-# Output APK path:
+# Output APK:
 # app/build/outputs/apk/debug/app-debug.apk
+
+# Install via ADB:
+adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
 ---
 
-## 6. How to Install the APK
+## 7. Manual Test Checklist (Physical Device)
 
-1. Transfer `app-debug.apk` to your Android device via USB or ADB:
-   ```bash
-   adb install -r app/build/outputs/apk/debug/app-debug.apk
-   ```
-2. If prompted on the device, allow installation from unknown sources.
-
----
-
-## 7. Enabling the Accessibility Service
-
-1. Open **Volume Guard**.
-2. Tap **"Open Accessibility Settings"**.
-3. Under **Installed apps** (or **Accessibility Services**), select **Volume Guard Key Interceptor**.
-4. Enable the service and accept Android's confirmation prompt.
-5. Return to Volume Guard; the status will now show **CONNECTED**.
-
----
-
-## 8. Tecno / OEM-Specific Considerations (e.g. Tecno POP 7)
-
-On devices running customized Android distributions (such as Tecno HiOS):
-1. **Background Management:**
-   - In **Settings → Battery Lab / Power Management**, configure Volume Guard to allow unrestricted background activity.
-2. **Accessibility Permission Preservation:**
-   - If the OEM system suspends accessibility permissions after extended inactivity, Volume Guard detects the disconnection immediately and prompts the user to re-enable it.
-3. **Volume Popups:**
-   - Consuming `KEYCODE_VOLUME_DOWN` (`return true`) prevents HiOS's custom on-screen volume slider from displaying when the button is pressed.
-
----
-
-## 9. Automated & Manual Test Checklist
-
-The project includes local Robolectric JVM tests in `VolumeGuardTest.kt` verifying:
-1. Operational activation clamps volume to 0.
-2. `AccessibilityService.onKeyEvent(Volume Up)` returns `false`, disengages guard, and persists OFF.
-3. `AccessibilityService.onKeyEvent(Volume Down)` returns `true` and maintains volume 0.
-4. Service disconnect immediately changes operational state to inactive while preserving user preference.
-5. Service reconnect restores persisted ON preference and clamps volume to 0.
-6. Guard OFF allows normal volume and passes through keys.
-7. Reactive receiver path clamps external volume changes to 0.
-8. Rapid Volume Up events are safe and idempotent.
-9. No initial or previous volume is stored or restored.
+| # | Test Scenario | Steps | Expected Result |
+|---|---|---|---|
+| 1 | Enable from non-zero | Set media volume to 10. Open app. Toggle Guard ON. | Volume immediately drops to 0. Status shows ACTIVE. |
+| 2 | Enable from zero | Set volume to 0. Toggle Guard ON. | Guard activates. Volume remains 0. |
+| 3 | Physical Volume Down | With Guard ON, press physical Volume Down. | Volume remains 0. Guard remains ON. |
+| 4 | Physical Volume Up | With Guard ON, press physical Volume Up. | Guard disengages immediately. Phone volume increases normally. |
+| 5 | Background / App Switch | Guard ON. Open YouTube/Telegram/Browser. Play media. | Volume remains locked at 0. |
+| 6 | Screen Locked | Guard ON. Lock screen. Press Volume Down. | Volume remains 0. |
+| 7 | Screen Locked + Volume Up | Guard ON. Lock screen. Press Volume Up. | Guard disengages. Volume increases. |
+| 8 | Rapid Button Presses | Guard ON. Rapidly press Volume Up 5 times. | Guard stays OFF. No crashes or lockups. |
+| 9 | UI Disable | Guard ON (vol 0). Toggle switch OFF in app. | Guard becomes OFF. Volume remains 0 (not restored). |
+| 10 | Service Disconnection | In Android Settings, disable Volume Guard accessibility. | App UI updates immediately to "Protection Inactive". |
+| 11 | Service Reconnection | Re-enable accessibility in Settings. | Guard automatically restores volume 0 protection. |

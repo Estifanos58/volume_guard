@@ -7,6 +7,7 @@ import android.view.KeyEvent
 import androidx.test.core.app.ApplicationProvider
 import com.example.core.GuardManager
 import com.example.core.GuardPreferences
+import com.example.observer.VolumeContentObserver
 import com.example.receiver.VolumeChangeReceiver
 import com.example.service.VolumeGuardAccessibilityService
 import org.junit.Assert.assertEquals
@@ -60,6 +61,7 @@ class VolumeGuardTest {
         assertTrue("Desired state must be ON", guardManager.desiredGuardEnabled.value)
         assertTrue("Service must be connected", guardManager.isServiceConnected.value)
         assertTrue("Protection must be operational", guardManager.isOperationalActive.value)
+        assertTrue("Fast hot-path flag must be true", service.isOperationalFast)
         assertEquals("Volume must be immediately forced to 0", 0, audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
     }
 
@@ -82,6 +84,7 @@ class VolumeGuardTest {
         assertFalse("Volume Up must return FALSE to let Android raise volume", consumed)
         assertFalse("Guard desired state must become OFF", guardManager.desiredGuardEnabled.value)
         assertFalse("Operational protection must become inactive", guardManager.isOperationalActive.value)
+        assertFalse("Fast hot-path flag must become false", service.isOperationalFast)
         assertFalse("Persisted state must be OFF", GuardPreferences.getInstance(context).isGuardEnabled)
     }
 
@@ -122,6 +125,7 @@ class VolumeGuardTest {
 
         assertFalse("Service connected must be false", guardManager.isServiceConnected.value)
         assertFalse("Operational protection must be inactive when service is disconnected", guardManager.isOperationalActive.value)
+        assertFalse("Fast hot-path flag must be false when service is unbound", service.isOperationalFast)
         assertTrue("User desired preference must be preserved", guardManager.desiredGuardEnabled.value)
         assertTrue("Persisted preference must remain ON", GuardPreferences.getInstance(context).isGuardEnabled)
     }
@@ -150,6 +154,7 @@ class VolumeGuardTest {
 
         assertTrue("Service connected should be true", guardManager.isServiceConnected.value)
         assertTrue("Operational protection should recover to ACTIVE", guardManager.isOperationalActive.value)
+        assertTrue("Fast hot-path flag must be active", newService.isOperationalFast)
         assertEquals("Media volume must be forced to 0 on reconnection", 0, audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
     }
 
@@ -187,10 +192,7 @@ class VolumeGuardTest {
 
         // Broadcast received
         val receiver = VolumeChangeReceiver()
-        val intent = Intent(VolumeChangeReceiver.VOLUME_CHANGED_ACTION).apply {
-            putExtra(VolumeChangeReceiver.EXTRA_VOLUME_STREAM_TYPE, AudioManager.STREAM_MUSIC)
-            putExtra(VolumeChangeReceiver.EXTRA_VOLUME_STREAM_VALUE, 12)
-        }
+        val intent = Intent(VolumeChangeReceiver.VOLUME_CHANGED_ACTION)
         receiver.onReceive(context, intent)
 
         assertEquals("Media volume must be immediately corrected to 0", 0, audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
@@ -232,5 +234,37 @@ class VolumeGuardTest {
 
         // Volume MUST remain at 0, not restored to 9
         assertEquals("Disabling guard must NOT restore previous volume", 0, audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
+    }
+
+    /**
+     * Test 10 — Narrowly Scoped ContentObserver Path:
+     * When ContentObserver detects volume settings write, it invokes reactive correction to 0.
+     */
+    @Test
+    fun test10_contentObserverTriggersImmediateCorrection() {
+        guardManager.setDesiredGuardEnabled(context, true)
+        assertEquals(0, audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
+
+        // Another app changes volume
+        audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, 7, 0)
+
+        // ContentObserver fires
+        val observer = VolumeContentObserver(context)
+        observer.onChange(false, null)
+
+        assertEquals("Media volume must be corrected back to 0", 0, audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
+    }
+
+    /**
+     * Test 11 — Monitors Active Only When Operational:
+     * Verifies that fast operational flag and monitors are deactivated when Guard is toggled OFF.
+     */
+    @Test
+    fun test11_monitorsAreActiveOnlyWhenOperational() {
+        guardManager.setDesiredGuardEnabled(context, true)
+        assertTrue(service.isOperationalFast)
+
+        guardManager.setDesiredGuardEnabled(context, false)
+        assertFalse(service.isOperationalFast)
     }
 }
