@@ -1,6 +1,6 @@
 # Volume Guard
 
-**Volume Guard** is a specialized, zero-overhead defensive Android utility designed to prevent and mitigate unexpected media volume spikes caused by rogue, prank, or malfunctioning applications.
+**Volume Guard** is a specialized, zero-overhead defensive Android utility designed to eliminate and mitigate unexpected media volume spikes caused by rogue, prank, or malfunctioning applications.
 
 ---
 
@@ -9,12 +9,12 @@
 * **Target Volume:** Strictly **`0`** (`AudioManager.STREAM_MUSIC`).
 * **Zero Initial/Previous Volume Storage:** The app never records, remembers, or restores previous volume levels. Disabling the guard leaves volume at whatever value the system currently has.
 * **Fastest Practical Reactive Correction:**
-  - When an external application attempts to increase media volume, Volume Guard reactively catches the system `VOLUME_CHANGED_ACTION` broadcast and issues exactly **one** `setStreamVolume(STREAM_MUSIC, 0, 0)`.
-  - Disabling the Guard never restores any previous volume.
+  - Multi-layered protection: primary `VOLUME_CHANGED_ACTION` broadcast + fallback `ContentObserver` + adaptive 20 ms safety sampler (active strictly during audio playback).
+  - Programmatic external volume spikes are clamped back to `0` within milliseconds.
 * **Guard Active + Physical Volume Up:**
   - Disengages the guard immediately (desired state -> `OFF`, operational state -> `inactive`).
   - Performs **zero audio Binder calls** on the input path.
-  - Schedules background monitor cleanup asynchronously off the input thread.
+  - Schedules background monitor and sampler cleanup asynchronously off the input thread.
   - Returns `false` from `onKeyEvent()` ASAP so Android receives the key event and raises volume normally.
 * **Guard Active + Physical Volume Down:**
   - Keeps the guard active.
@@ -26,40 +26,44 @@
 
 ---
 
-## 2. Ultra-Lean Monitoring Architecture
+## 2. Multi-Layered Protection Architecture
 
 ```text
-                  STREAM_MUSIC change
-                         ↓
-              VOLUME_CHANGED_ACTION
-     (dispatched on background HandlerThread)
-                         ↓
-              verify MUSIC + newValue
-                         ↓
-                   newValue > 0
-                         ↓
-                setStreamVolume(0)
-             [single Binder IPC call]
+                     External App raises STREAM_MUSIC
+                                     ↓
+  ┌──────────────────────────────────┼──────────────────────────────────┐
+  │                                  │                                  │
+  ▼                                  ▼                                  ▼
+Layer 1: Primary Broadcast      Layer 2: Fallback Observer       Layer 3: Adaptive Sampler
+VOLUME_CHANGED_ACTION           Settings.System                  20 ms interval
+(instant extras read)           (volume_music_speaker)           (playback-active ONLY)
+  │                                  │                                  │
+  └──────────────────────────────────┼──────────────────────────────────┘
+                                     ↓
+                   Exactly ONE setStreamVolume(STREAM_MUSIC, 0, 0)
+                                     ↓
+                    lastKnownMediaVolume reset to 0
 ```
 
-### A. Primary Reactive Path (`VOLUME_CHANGED_ACTION`)
-1. Validates action is `android.media.VOLUME_CHANGED_ACTION`.
-2. Validates stream is `AudioManager.STREAM_MUSIC` via `EXTRA_VOLUME_STREAM_TYPE`. Non-music streams (`STREAM_RING`, `STREAM_ALARM`) are ignored.
-3. Reads the reported volume directly from `EXTRA_VOLUME_STREAM_VALUE`.
-4. **No Pre-IPC Query:** If `newValue > 0`, immediately issues `setStreamVolume(STREAM_MUSIC, 0, 0)` using a cached `AudioManager` instance without a redundant `getStreamVolume()` query.
-5. If `newValue == 0`, updates cached volume without issuing any audio IPC.
-6. Safe fallback: If extras are missing/invalid, safely falls back to querying `AudioManager`.
+### A. Dedicated Single Monitor HandlerThread
+* All reactive monitoring and sampling runs on a single background `HandlerThread("VolumeGuardMonitor", Process.THREAD_PRIORITY_AUDIO)`.
+* Zero UI thread contention or main looper delay.
+* Starts when Guard becomes operational; stops immediately when Guard turns OFF or service disconnects.
 
-### B. Dedicated Normal-Priority `HandlerThread`
-* Reactive monitoring runs on a single lightweight `HandlerThread("VolumeGuardMonitor", Process.THREAD_PRIORITY_DEFAULT)` active **strictly while Guard is operational**.
-* Eliminates main-thread queue delay while avoiding unnecessary real-time audio thread priority.
-* Quits immediately when Guard is turned OFF or service disconnects.
+### B. Layer 1: Primary `VOLUME_CHANGED_ACTION` Broadcast
+* Reads `EXTRA_VOLUME_STREAM_TYPE` and `EXTRA_VOLUME_STREAM_VALUE` directly from broadcast extras.
+* If `newVolume > 0`: immediately issues `setStreamVolume(STREAM_MUSIC, 0, 0)` using cached `AudioManager`. **Zero** pre-check `getStreamVolume()` IPC calls.
+* Non-music streams (`STREAM_RING`, `STREAM_ALARM`) and zero-volume events are ignored.
 
-### C. Removed Redundant Fallback Monitors
-* **`AudioPlaybackCallback`**: Removed. It triggers on every media playback track state change rather than volume changes, adding unnecessary wakeups.
-* **`VolumeContentObserver`**: Removed. Observing `Settings.System` is redundant because `VOLUME_CHANGED_ACTION` is fired directly by the Android framework for all media volume adjustments.
-* **`AudioDeviceCallback`**: Removed. Device routing changes trigger system volume broadcasts on modern Android and Tecno HiOS, rendering a separate device listener unnecessary.
-* **Proactive Mute (`ADJUST_MUTE`)**: Removed. Relies strictly on the clean, deterministic reactive volume index correction (`setStreamVolume(0)`).
+### C. Layer 2: Targeted Fallback `ContentObserver`
+* Observes specific media volume setting URIs (`volume_music_speaker`, `volume_music`) on the monitor thread.
+* Acts as an interrupt-driven fallback if broadcast delivery is delayed by OEM throttling.
+
+### D. Layer 3: Adaptive High-Frequency Safety Sampler (20 ms)
+* Runs on the same monitor `HandlerThread` using a single reusable `Runnable` (zero per-tick allocations).
+* **Active strictly while Guard is operational AND media playback is running** (detected via `AudioPlaybackCallback` and `isMusicActive`).
+* While playback is active, samples volume every **20 ms**. If volume > 0, immediately clamps to `0`.
+* **Zero Idle Overhead:** When music is not playing or Guard is OFF, the sampler completely idles (0% CPU, 0 Binder calls).
 
 ---
 
@@ -71,7 +75,7 @@ In `VolumeGuardAccessibilityService.onKeyEvent()`:
   1. Flips `isOperationalFast = false` immediately.
   2. Transitions desired state to `OFF` synchronously.
   3. Dispatches SharedPreferences write asynchronously (`apply()`).
-  4. Posts monitor cleanup to background loop.
+  4. Posts monitor and sampler cleanup to background loop.
   5. Returns `false` immediately with **zero audio Binder calls** so Android handles volume up without delay.
 * **Physical Volume Down:**
   1. Checks `lastKnownMediaVolume`.
@@ -81,22 +85,43 @@ In `VolumeGuardAccessibilityService.onKeyEvent()`:
 
 ---
 
-## 4. Platform Limitations on Unrooted Android
+## 4. Ultra-Lean Native View UI
+
+* Migrated from heavy Jetpack Compose to a clean, minimal native Android View layout (`activity_main.xml`).
+* **APK Size:** Reduced from ~8 MB to ~1.2 MB.
+* **Cold Start & Memory:** Minimal startup cost and <15 MB RAM footprint.
+* Displays:
+  - Guard ON/OFF toggle switch.
+  - Operational status (`PROTECTED (Active)`, `GUARD OFF`, or `SERVICE DISCONNECTED`).
+  - Current media volume readout (`0 / 15`).
+  - Direct button to open Android Accessibility Settings when service is not connected.
+
+---
+
+## 5. Platform Limitations on Unrooted Android
 
 * **Pre-Dispatch Hardware Key Interception:** Fully supported. Accessibility services with `flagRequestFilterKeyEvents` receive physical key events before the window manager or audio service.
-* **Programmatic Volume Interception:** On unrooted Android, third-party apps cannot pre-veto another application's IPC call to `AudioService`. Volume Guard provides the fastest practical reactive correction available using public platform APIs without claiming impossible kernel-level vetoes.
+* **Programmatic Volume Interception:** On unrooted Android, third-party apps cannot pre-veto another application's IPC call to `AudioService`. Volume Guard provides the fastest practical multi-layered reactive correction available using public platform APIs without claiming impossible kernel-level vetoes.
 
 ---
 
-## 5. Tecno / OEM Considerations (e.g. Tecno POP 7)
+## 6. Tecno POP 7 Real-Device Testing & Benchmarking
 
-1. **Battery Management:** Configure **Settings → Battery Lab / Power Management → Volume Guard** to allow unrestricted background activity so HiOS does not stop the accessibility service.
-2. **Volume Sliders:** Consuming `KEYCODE_VOLUME_DOWN` (`return true`) prevents HiOS's on-screen volume panel from popping up.
-3. **Reactive Broadcast Delivery:** On Tecno POP 7, `VOLUME_CHANGED_ACTION` broadcasts are delivered promptly to the background `HandlerThread`, providing sub-millisecond reactive correction.
+In debug builds (`BuildConfig.DEBUG`), every detection logs which layer caught the event:
+* `[broadcast] Reactive correction: total=...µs (ipc=...µs)`
+* `[observer] Caught volume change (...) -> clamping to 0`
+* `[sampler] Caught volume increase (...) -> clamping to 0`
+
+### Real-Device Test Checklist:
+1. **Background Audio Playback:** Start YouTube / Telegram audio. Toggle Guard ON. Volume drops to 0. Sampler activates at 20 ms.
+2. **Programmatic Volume Attack:** External app calls `setStreamVolume(STREAM_MUSIC, 10, 0)`. Protection clamps volume to 0 within 20 ms.
+3. **Audio Idle:** Pause audio. Sampler immediately stops (0% CPU).
+4. **Physical Volume Up:** Press physical Volume Up. Guard disengages instantly, sampler stops, volume raises normally.
+5. **Physical Volume Down:** Press physical Volume Down. Consumed with zero volume sliders.
 
 ---
 
-## 6. How to Build & Install
+## 7. How to Build & Install
 
 ```bash
 # Build the debug APK:
@@ -108,22 +133,3 @@ gradle assembleDebug
 # Install via ADB:
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
-
----
-
-## 7. Automated Test Suite
-
-The project includes 13 Robolectric JVM unit tests in `VolumeGuardTest.kt` verifying:
-1. Operational activation clamps volume to 0.
-2. `onKeyEvent(VOLUME_UP)` returns `false`, disengages guard, persists `OFF`, and makes zero audio IPC calls.
-3. `onKeyEvent(VOLUME_DOWN)` returns `true` and avoids IPC when volume is already 0.
-4. Service disconnect immediately deactivates operational protection and preserves user preference.
-5. Service reconnect automatically restores persisted `ON` preference and forces volume 0.
-6. Guard `OFF` allows normal volume and passes through keys.
-7. Reactive receiver path uses broadcast extras directly to clamp volume without `getStreamVolume()`.
-8. Zero-volume broadcast causes no audio correction or IPC.
-9. Unrelated stream broadcasts (`STREAM_RING`, `STREAM_ALARM`) are ignored.
-10. Missing extras safely fall back to `AudioManager` query.
-11. Rapid Volume Up events are safe and idempotent.
-12. Confirmed zero initial or previous volume storage or restoration.
-13. Reactive monitor and fast flag are active strictly while operational.

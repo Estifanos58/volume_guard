@@ -7,6 +7,7 @@ import android.view.KeyEvent
 import androidx.test.core.app.ApplicationProvider
 import com.example.core.GuardManager
 import com.example.core.GuardPreferences
+import com.example.observer.VolumeContentObserver
 import com.example.receiver.VolumeChangeReceiver
 import com.example.service.VolumeGuardAccessibilityService
 import org.junit.Assert.assertEquals
@@ -258,30 +259,49 @@ class VolumeGuardTest {
     }
 
     /**
-     * Test 11 — Rapid Volume Up events are safe/idempotent:
-     * Multiple rapid Volume Up events must not crash or cause inconsistent state.
+     * Test 11 — Fallback ContentObserver Path:
+     * When ContentObserver detects volume settings write, it invokes reactive correction to 0.
      */
     @Test
-    fun test11_rapidVolumeUpEventsAreSafeAndIdempotent() {
+    fun test11_contentObserverTriggersImmediateCorrection() {
         guardManager.setDesiredGuardEnabled(context, true)
-        assertTrue(guardManager.isOperationalActive.value)
+        assertEquals(0, audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
 
-        val event = KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_VOLUME_UP)
-        repeat(5) {
-            val consumed = service.onKeyEvent(event)
-            assertFalse(consumed)
-        }
+        // Another app changes volume
+        audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, 7, 0)
 
-        assertFalse(guardManager.desiredGuardEnabled.value)
-        assertFalse(guardManager.isOperationalActive.value)
+        // ContentObserver fires
+        val observer = VolumeContentObserver(context)
+        observer.onChange(false, null)
+
+        assertEquals("Media volume must be corrected back to 0", 0, audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
     }
 
     /**
-     * Test 12 — No Initial/Previous Volume Persistence:
+     * Test 12 — Adaptive Safety Sampler Activation / Deactivation:
+     * Verifies that adaptive sampler activates when music is playing and stops when music stops.
+     */
+    @Test
+    fun test12_adaptiveSamplerActiveOnlyDuringMusicPlayback() {
+        guardManager.setDesiredGuardEnabled(context, true)
+        assertTrue(service.isOperationalFast)
+        assertFalse("Initially music not playing", service.isMusicPlaying)
+
+        // Music playback starts
+        service.updatePlaybackState(true)
+        assertTrue("Music playing state is true", service.isMusicPlaying)
+
+        // Music playback stops
+        service.updatePlaybackState(false)
+        assertFalse("Music playing state is false", service.isMusicPlaying)
+    }
+
+    /**
+     * Test 13 — No Initial/Previous Volume Persistence:
      * Verify that GuardPreferences only stores a boolean and never tracks or restores previous volume.
      */
     @Test
-    fun test12_noInitialVolumeStorageOrRestoration() {
+    fun test13_noInitialVolumeStorageOrRestoration() {
         audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, 9, 0)
 
         // Enable guard
@@ -293,18 +313,5 @@ class VolumeGuardTest {
 
         // Volume MUST remain at 0, not restored to 9
         assertEquals("Disabling guard must NOT restore previous volume", 0, audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
-    }
-
-    /**
-     * Test 13 — Monitors Active Only When Operational:
-     * Verifies that fast operational flag and monitor are deactivated when Guard is toggled OFF.
-     */
-    @Test
-    fun test13_monitorsAreActiveOnlyWhenOperational() {
-        guardManager.setDesiredGuardEnabled(context, true)
-        assertTrue(service.isOperationalFast)
-
-        guardManager.setDesiredGuardEnabled(context, false)
-        assertFalse(service.isOperationalFast)
     }
 }

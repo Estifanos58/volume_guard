@@ -15,7 +15,7 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * Interface for registering and unregistering the volume broadcast receiver on demand.
+ * Interface for registering and unregistering the volume monitors on demand.
  */
 fun interface VolumeMonitorController {
     fun setMonitorsActive(active: Boolean)
@@ -27,11 +27,10 @@ fun interface VolumeMonitorController {
  * Streamlined Architecture:
  * 1. Cached [AudioManager] reference eliminates repeated getSystemService() lookups.
  * 2. Pure reactive correction: exactly one setStreamVolume(STREAM_MUSIC, 0, 0) on violation.
- * 3. No proactive mute/unmute: target volume is strictly 0 without audio HAL muting tricks.
- * 4. Physical Volume Up has ZERO audio Binder calls and returns false immediately.
- * 5. Physical Volume Down checks [lastKnownMediaVolume] and performs ZERO audio Binder calls
+ * 3. Physical Volume Up has ZERO audio Binder calls and returns false immediately.
+ * 4. Physical Volume Down checks [lastKnownMediaVolume] and performs ZERO audio Binder calls
  *    when volume is already 0.
- * 6. Disabling Guard never restores any previous volume.
+ * 5. Disabling Guard never restores any previous volume.
  */
 class GuardManager private constructor() {
 
@@ -49,9 +48,6 @@ class GuardManager private constructor() {
 
     private val _maxMediaVolume = MutableStateFlow(15)
     val maxMediaVolume: StateFlow<Int> = _maxMediaVolume.asStateFlow()
-
-    private val _recentLogs = MutableStateFlow<List<String>>(emptyList())
-    val recentLogs: StateFlow<List<String>> = _recentLogs.asStateFlow()
 
     // Cached AudioManager reference to avoid repeated getSystemService() lookups
     @Volatile
@@ -96,7 +92,7 @@ class GuardManager private constructor() {
         val prefs = GuardPreferences.getInstance(context)
         _desiredGuardEnabled.value = prefs.isGuardEnabled
         if (BuildConfig.DEBUG) {
-            logDebug("AccessibilityService connected (desired=${prefs.isGuardEnabled})")
+            Log.d(TAG, "AccessibilityService connected (desired=${prefs.isGuardEnabled})")
         }
 
         updateOperationalState(context)
@@ -109,7 +105,7 @@ class GuardManager private constructor() {
     @Synchronized
     fun onServiceDisconnected(context: Context? = null) {
         if (BuildConfig.DEBUG) {
-            logDebug("AccessibilityService disconnected -> operational protection deactivated")
+            Log.d(TAG, "AccessibilityService disconnected -> operational protection deactivated")
         }
         _isServiceConnected.value = false
         monitorController?.setMonitorsActive(false)
@@ -125,7 +121,7 @@ class GuardManager private constructor() {
         _desiredGuardEnabled.value = enabled
         GuardPreferences.getInstance(context).isGuardEnabled = enabled
         if (BuildConfig.DEBUG) {
-            logDebug("User desired guard changed to $enabled")
+            Log.d(TAG, "User desired guard changed to $enabled")
         }
 
         updateOperationalState(context)
@@ -146,7 +142,7 @@ class GuardManager private constructor() {
         lastKnownMediaVolume = 0
         GuardPreferences.getInstance(context).isGuardEnabled = false
         if (BuildConfig.DEBUG) {
-            logDebug("Physical Volume Up -> Disengaged guard")
+            Log.d(TAG, "Physical Volume Up -> Disengaged guard")
         }
     }
 
@@ -165,11 +161,11 @@ class GuardManager private constructor() {
      * Primary reactive volume-change handler.
      * Executes exactly one setStreamVolume(STREAM_MUSIC, 0, 0) call using cached AudioManager.
      */
-    fun onMusicVolumeIncreaseDetected(context: Context, newVolume: Int) {
+    fun onMusicVolumeIncreaseDetected(context: Context, newVolume: Int, detector: String = "broadcast") {
         lastKnownMediaVolume = newVolume
         _currentMediaVolume.value = newVolume
         if (_isOperationalActive.value && newVolume > 0) {
-            forceMediaVolumeZero(context, reason = "Reactive correction ($newVolume -> 0)")
+            forceMediaVolumeZero(context, reason = "Reactive correction via $detector ($newVolume -> 0)")
         }
     }
 
@@ -195,7 +191,7 @@ class GuardManager private constructor() {
             lastKnownMediaVolume = 0
             _currentMediaVolume.value = 0
             if (BuildConfig.DEBUG && reason.isNotEmpty()) {
-                logDebug("Volume 0 enforced ($reason)")
+                Log.d(TAG, "Volume 0 enforced ($reason)")
             }
         } catch (e: Exception) {
             if (BuildConfig.DEBUG) {
@@ -249,23 +245,9 @@ class GuardManager private constructor() {
         if (previousState != newState) {
             monitorController?.setMonitorsActive(newState)
             if (BuildConfig.DEBUG) {
-                logDebug("Operational protection: $newState (desired=${_desiredGuardEnabled.value}, connected=${_isServiceConnected.value})")
+                Log.d(TAG, "Operational protection: $newState (desired=${_desiredGuardEnabled.value}, connected=${_isServiceConnected.value})")
             }
         }
-    }
-
-    private fun logDebug(message: String) {
-        if (!BuildConfig.DEBUG) return
-
-        val timestamp = SimpleDateFormat("HH:mm:ss.SSS", Locale.US).format(Date())
-        val formatted = "[$timestamp] $message"
-        val current = _recentLogs.value.toMutableList()
-        if (current.size >= 30) {
-            current.removeAt(0)
-        }
-        current.add(formatted)
-        _recentLogs.value = current
-        Log.d(TAG, message)
     }
 
     companion object {
