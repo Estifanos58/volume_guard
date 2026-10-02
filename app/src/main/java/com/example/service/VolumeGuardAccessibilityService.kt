@@ -10,7 +10,9 @@ import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.os.Build
 import android.os.Handler
+import android.os.HandlerThread
 import android.os.Looper
+import android.os.Process
 import android.provider.Settings
 import android.util.Log
 import android.view.KeyEvent
@@ -21,22 +23,22 @@ import com.example.observer.VolumeContentObserver
 import com.example.receiver.VolumeChangeReceiver
 
 /**
- * Ultra-low latency Accessibility Service responsible for physical volume-key filtering.
+ * Ultra-low latency Accessibility Service responsible for physical volume-key filtering
+ * and high-priority reactive audio protection.
  *
- * Latency & Resource Architecture:
+ * Latency & Auditory Leak Prevention Architecture:
  * 1. Physical Key Hot Path:
- *    - Uses [@Volatile isOperationalFast] for O(1) key filtering with ZERO allocations.
- *    - Volume Up (Override): Flips local flag OFF, persists preference, posts monitor
- *      cleanup asynchronously to a background Handler, and immediately returns FALSE.
- *    - Volume Down: Returns TRUE immediately; bypasses audio Binder IPC if last-known
- *      volume is already 0.
- * 2. Primary Reactive Monitor:
- *    - [VolumeChangeReceiver] reacts directly to VOLUME_CHANGED_ACTION broadcast extras
- *      without performing redundant getStreamVolume() queries.
- * 3. Fallback Reactive Monitors:
- *    - Narrowly scoped [VolumeContentObserver] for music volume setting URIs.
- *    - Low-frequency [AudioDeviceCallback] (API 23+) reasserting volume 0 when
- *      Bluetooth/headphones connect.
+ *    - Uses [@Volatile isOperationalFast] for O(1) decision making with ZERO allocations.
+ *    - Volume Up (Override): Flips local flag OFF, lifts proactive mute, persists preference,
+ *      schedules monitor cleanup asynchronously, and immediately returns FALSE.
+ *    - Volume Down: Consumes key (returns TRUE) with ZERO audio IPC if cached volume is already 0.
+ * 2. Dedicated Background Monitor Thread:
+ *    - Reactive monitors run on a high-priority [HandlerThread] (Process.THREAD_PRIORITY_URGENT_AUDIO)
+ *      to eliminate main looper queue latency.
+ * 3. Proactive Mute & Targeted Fallback:
+ *    - Operates with proactive STREAM_MUSIC mute on activation to minimize auditory leaks.
+ *    - Narrowly scoped [VolumeContentObserver] on the same dedicated background thread.
+ *    - [AudioDeviceCallback] reasserting volume 0 when Bluetooth/headsets route audio.
  */
 class VolumeGuardAccessibilityService : AccessibilityService() {
 
@@ -45,6 +47,9 @@ class VolumeGuardAccessibilityService : AccessibilityService() {
         private set
 
     private val asyncCleanupHandler = Handler(Looper.getMainLooper())
+    private var monitorThread: HandlerThread? = null
+    private var monitorHandler: Handler? = null
+
     private var volumeChangeReceiver: VolumeChangeReceiver? = null
     private var volumeContentObserver: VolumeContentObserver? = null
     private var audioDeviceCallback: AudioDeviceCallback? = null
@@ -79,7 +84,7 @@ class VolumeGuardAccessibilityService : AccessibilityService() {
             if (event.action == KeyEvent.ACTION_DOWN) {
                 // 1. Immediately flip local fast flag to false
                 isOperationalFast = false
-                // 2. Synchronous state update & async preference persistence
+                // 2. Synchronous state update, lifts proactive mute, and async preference persistence
                 GuardManager.instance.onPhysicalVolumeUpFast(this)
                 // 3. Post monitor cleanup asynchronously off the critical hot path
                 asyncCleanupHandler.post {
@@ -117,7 +122,7 @@ class VolumeGuardAccessibilityService : AccessibilityService() {
             Log.d(TAG, "onUnbind()")
         }
         setMonitorsActive(false)
-        GuardManager.instance.onServiceDisconnected()
+        GuardManager.instance.onServiceDisconnected(this)
         return super.onUnbind(intent)
     }
 
@@ -127,7 +132,7 @@ class VolumeGuardAccessibilityService : AccessibilityService() {
             Log.d(TAG, "onDestroy()")
         }
         setMonitorsActive(false)
-        GuardManager.instance.onServiceDisconnected()
+        GuardManager.instance.onServiceDisconnected(this)
     }
 
     /**
@@ -144,20 +149,30 @@ class VolumeGuardAccessibilityService : AccessibilityService() {
 
     private fun registerMonitors() {
         try {
-            // 1. Primary monitor: VOLUME_CHANGED_ACTION broadcast receiver
+            // Start dedicated high-priority HandlerThread for reactive audio monitoring
+            if (monitorThread == null) {
+                monitorThread = HandlerThread("VolumeGuardMonitor", Process.THREAD_PRIORITY_URGENT_AUDIO).apply {
+                    start()
+                }
+                monitorHandler = Handler(monitorThread!!.looper)
+            }
+
+            val handler = monitorHandler ?: Handler(Looper.getMainLooper())
+
+            // 1. Primary monitor: VOLUME_CHANGED_ACTION broadcast receiver on background handler
             if (volumeChangeReceiver == null) {
                 volumeChangeReceiver = VolumeChangeReceiver()
                 val filter = IntentFilter(VolumeChangeReceiver.VOLUME_CHANGED_ACTION)
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    registerReceiver(volumeChangeReceiver, filter, Context.RECEIVER_EXPORTED)
+                    registerReceiver(volumeChangeReceiver, filter, null, handler, Context.RECEIVER_EXPORTED)
                 } else {
-                    registerReceiver(volumeChangeReceiver, filter)
+                    registerReceiver(volumeChangeReceiver, filter, null, handler)
                 }
             }
 
-            // 2. Fallback monitor: Narrowly scoped ContentObserver for music volume settings
+            // 2. Fallback monitor: Narrowly scoped ContentObserver on background handler
             if (volumeContentObserver == null) {
-                volumeContentObserver = VolumeContentObserver(this)
+                volumeContentObserver = VolumeContentObserver(this, handler)
                 val musicUri = Settings.System.getUriFor("volume_music_speaker")
                     ?: Settings.System.getUriFor("volume_music")
                 if (musicUri != null) {
@@ -167,14 +182,13 @@ class VolumeGuardAccessibilityService : AccessibilityService() {
                 }
             }
 
-            // 3. Low-frequency safety callback: AudioDeviceCallback for Bluetooth/headset routing changes
+            // 3. AudioDeviceCallback for Bluetooth/headset routing changes on background handler
             if (audioDeviceCallback == null) {
                 val am = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
                 if (am != null) {
                     audioDeviceCallback = object : AudioDeviceCallback() {
                         override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>?) {
                             if (isOperationalFast) {
-                                // When Bluetooth or wired headset connects, reassert volume 0
                                 GuardManager.instance.forceMediaVolumeZero(
                                     this@VolumeGuardAccessibilityService,
                                     reason = "Audio device connected"
@@ -182,7 +196,7 @@ class VolumeGuardAccessibilityService : AccessibilityService() {
                             }
                         }
                     }
-                    am.registerAudioDeviceCallback(audioDeviceCallback!!, Handler(Looper.getMainLooper()))
+                    am.registerAudioDeviceCallback(audioDeviceCallback!!, handler)
                 }
             }
         } catch (e: Exception) {
@@ -207,6 +221,9 @@ class VolumeGuardAccessibilityService : AccessibilityService() {
                 audioDeviceCallback?.let { am?.unregisterAudioDeviceCallback(it) }
                 audioDeviceCallback = null
             }
+            monitorThread?.quitSafely()
+            monitorThread = null
+            monitorHandler = null
         } catch (e: Exception) {
             if (BuildConfig.DEBUG) {
                 Log.e(TAG, "Error unregistering volume monitors", e)

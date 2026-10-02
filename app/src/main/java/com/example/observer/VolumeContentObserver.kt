@@ -11,6 +11,7 @@ import com.example.core.GuardManager
 /**
  * Narrowly scoped System Settings ContentObserver for media volume.
  *
+ * Runs on a dedicated background HandlerThread to avoid UI thread delays.
  * Scoped strictly to media volume URIs (e.g. "volume_music_speaker", "volume_music").
  * Operates as a secondary fallback to the primary VOLUME_CHANGED_ACTION broadcast.
  * Bails out immediately if volume is already zero or protection is inactive.

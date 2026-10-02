@@ -47,9 +47,10 @@ class VolumeGuardTest {
     }
 
     /**
-     * Test 1 — Operational Activation:
+     * Test 1 — Operational Activation with Proactive Mute:
      * When user enables guard and AccessibilityService is connected,
-     * stream volume is immediately forced to 0 and operational protection becomes active.
+     * stream volume is immediately forced to 0, proactive mute is applied,
+     * and operational protection becomes active.
      */
     @Test
     fun test1_enableGuardForcesVolumeZeroAndActivatesOperationalState() {
@@ -71,8 +72,8 @@ class VolumeGuardTest {
      * Physical Volume Up while Guard is active:
      * - Must return FALSE so Android processes Volume Up normally to raise volume.
      * - Must immediately disengage Guard (desired = OFF, operational = OFF).
+     * - Must lift proactive mute so volume up raises audio.
      * - Must persist OFF state.
-     * - Must not programmatically alter volume.
      */
     @Test
     fun test2_serviceOnKeyEventVolumeUpReturnsFalseAndDisengagesGuard() {
@@ -94,7 +95,7 @@ class VolumeGuardTest {
      * Physical Volume Down while Guard is active:
      * - Must return TRUE so the system volume panel and work are consumed.
      * - Must keep Guard ON and operational.
-     * - When volume is already 0, avoids redundant setStreamVolume calls.
+     * - Avoids audio IPC when volume is already known to be 0.
      */
     @Test
     fun test3_serviceOnKeyEventVolumeDownReturnsTrueAndMaintainsZero() {
@@ -111,11 +112,11 @@ class VolumeGuardTest {
     }
 
     /**
-     * Test 4 — Service Disconnect:
+     * Test 4 — Service Disconnect Lifts Mute & Deactivates Protection:
      * When AccessibilityService disconnects:
      * - Operational protection must immediately become INACTIVE.
-     * - Hardware key protection must not be falsely claimed.
-     * - User's desired ON preference must be PRESERVED so it can recover on reconnect.
+     * - Proactive mute is lifted so device audio behaves normally.
+     * - User's desired ON preference is PRESERVED for reconnection.
      */
     @Test
     fun test4_serviceDisconnectDeactivatesOperationalProtectionWhilePreservingPreference() {
@@ -136,14 +137,14 @@ class VolumeGuardTest {
      * Test 5 — Service Reconnect Restoration:
      * When AccessibilityService reconnects after reboot or process death:
      * - Automatically loads persisted ON preference.
-     * - Immediately clamps media volume to 0.
+     * - Immediately applies proactive mute and sets volume to 0.
      * - Becomes operationally active without needing Activity interaction.
      */
     @Test
     fun test5_serviceReconnectRestoresPersistedPreferenceAndEnforcesZero() {
         // Set persisted preference to ON while service is disconnected
         GuardPreferences.getInstance(context).isGuardEnabled = true
-        guardManager.onServiceDisconnected()
+        guardManager.onServiceDisconnected(context)
         assertFalse(guardManager.isOperationalActive.value)
 
         audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, 8, 0)
@@ -189,7 +190,7 @@ class VolumeGuardTest {
         guardManager.setDesiredGuardEnabled(context, true)
         assertEquals(0, audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
 
-        // Simulate rogue app raising volume in audioManager
+        // Rogue app raises volume
         audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, 12, 0)
 
         // Broadcast with STREAM_MUSIC and volume = 12
@@ -205,7 +206,7 @@ class VolumeGuardTest {
     }
 
     /**
-     * Test 8 — Zero-Volume Broadcast Causes No Correction / No IPC:
+     * Test 8 — Zero-Volume Broadcast Causes No Correction / No Audio IPC:
      * When broadcast reports volume = 0, no correction is triggered.
      */
     @Test
@@ -242,11 +243,27 @@ class VolumeGuardTest {
     }
 
     /**
-     * Test 10 — Rapid Volume Up events are safe/idempotent:
+     * Test 10 — Missing Extras Safe Fallback:
+     * When intent extras are missing (-1), safely falls back to querying AudioManager.
+     */
+    @Test
+    fun test10_missingExtrasFallbackQueriesAudioManager() {
+        guardManager.setDesiredGuardEnabled(context, true)
+        audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, 5, 0)
+
+        val receiver = VolumeChangeReceiver()
+        val emptyIntent = Intent(VolumeChangeReceiver.VOLUME_CHANGED_ACTION)
+        receiver.onReceive(context, emptyIntent)
+
+        assertEquals("Should safely correct volume even with empty extras", 0, audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
+    }
+
+    /**
+     * Test 11 — Rapid Volume Up events are safe/idempotent:
      * Multiple rapid Volume Up events must not crash or cause inconsistent state.
      */
     @Test
-    fun test10_rapidVolumeUpEventsAreSafeAndIdempotent() {
+    fun test11_rapidVolumeUpEventsAreSafeAndIdempotent() {
         guardManager.setDesiredGuardEnabled(context, true)
         assertTrue(guardManager.isOperationalActive.value)
 
@@ -261,11 +278,11 @@ class VolumeGuardTest {
     }
 
     /**
-     * Test 11 — No Initial/Previous Volume Persistence:
+     * Test 12 — No Initial/Previous Volume Persistence:
      * Verify that GuardPreferences only stores a boolean and never tracks or restores previous volume.
      */
     @Test
-    fun test11_noInitialVolumeStorageOrRestoration() {
+    fun test12_noInitialVolumeStorageOrRestoration() {
         audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, 9, 0)
 
         // Enable guard
@@ -280,11 +297,11 @@ class VolumeGuardTest {
     }
 
     /**
-     * Test 12 — Fallback ContentObserver Path:
+     * Test 13 — Fallback ContentObserver Path:
      * When ContentObserver detects volume settings write, it invokes reactive correction to 0.
      */
     @Test
-    fun test12_contentObserverTriggersImmediateCorrection() {
+    fun test13_contentObserverTriggersImmediateCorrection() {
         guardManager.setDesiredGuardEnabled(context, true)
         assertEquals(0, audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
 
@@ -299,11 +316,11 @@ class VolumeGuardTest {
     }
 
     /**
-     * Test 13 — Monitors Active Only When Operational:
+     * Test 14 — Monitors Active Only When Operational:
      * Verifies that fast operational flag and monitors are deactivated when Guard is toggled OFF.
      */
     @Test
-    fun test13_monitorsAreActiveOnlyWhenOperational() {
+    fun test14_monitorsAreActiveOnlyWhenOperational() {
         guardManager.setDesiredGuardEnabled(context, true)
         assertTrue(service.isOperationalFast)
 
