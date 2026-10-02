@@ -7,12 +7,10 @@ import android.provider.Settings
 import android.text.TextUtils
 import android.util.Log
 import com.example.BuildConfig
+import com.example.service.PrivacyMaskService
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
 /**
  * Interface for registering and unregistering the volume monitors on demand.
@@ -31,6 +29,7 @@ fun interface VolumeMonitorController {
  * 4. Physical Volume Down checks [lastKnownMediaVolume] and performs ZERO audio Binder calls
  *    when volume is already 0.
  * 5. Disabling Guard never restores any previous volume.
+ * 6. Coordinates dedicated [PrivacyMaskService] on desired Guard state transitions.
  */
 class GuardManager private constructor() {
 
@@ -99,6 +98,7 @@ class GuardManager private constructor() {
 
         if (_isOperationalActive.value) {
             forceMediaVolumeZero(context, reason = "Service connected with desired ON")
+            PrivacyMaskService.start(context)
         }
     }
 
@@ -126,10 +126,14 @@ class GuardManager private constructor() {
 
         updateOperationalState(context)
 
-        if (enabled && _isOperationalActive.value) {
-            forceMediaVolumeZero(context, reason = "Guard activated by user")
+        if (enabled) {
+            PrivacyMaskService.start(context)
+            if (_isOperationalActive.value) {
+                forceMediaVolumeZero(context, reason = "Guard activated by user")
+            }
+        } else {
+            PrivacyMaskService.stop(context)
         }
-        // When disabled: leaves volume untouched at whatever value Android currently has
     }
 
     /**

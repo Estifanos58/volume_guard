@@ -16,23 +16,23 @@ import android.util.Log
 import android.view.KeyEvent
 import android.view.accessibility.AccessibilityEvent
 import com.example.BuildConfig
-import com.example.audio.PrivacyMaskPlayer
 import com.example.core.GuardManager
 import com.example.observer.VolumeContentObserver
 import com.example.receiver.VolumeChangeReceiver
 
 /**
- * Ultra-low latency Accessibility Service responsible for physical volume-key filtering,
- * deterministic multi-channel reactive volume protection, and optional privacy audio masking.
+ * Ultra-low latency Accessibility Service responsible for physical volume-key filtering
+ * and deterministic multi-channel reactive volume protection.
  *
  * Protection Channels (all on single HandlerThread):
  * 1. Primary Broadcast: [VolumeChangeReceiver] for instant event extras reading.
  * 2. Targeted Fallback: [VolumeContentObserver] observing media volume setting URIs.
  * 3. Continuous 10 ms Safety Sampler: Runs continuously while Guard is operational,
  *    providing deterministic tens-of-milliseconds recovery regardless of OEM broadcast throttling.
- * 4. Supplemental Privacy Mask: [PrivacyMaskPlayer] loops speech-shaped broadband noise using
- *    a static AudioTrack. Inaudible at volume 0; bursts through simultaneously if an app raises
- *    STREAM_MUSIC to obscure speech comprehension until volume is forced back to 0.
+ *
+ * Supplemental Privacy Mask:
+ * - Managed independently by dedicated foreground service [PrivacyMaskService].
+ * - Remains continuously active while Guard is ON even if AccessibilityService is paused or reconnected.
  *
  * Hot Path:
  * - Volume Up: Sets volatile flag false, disengages guard, posts async cleanup, returns false.
@@ -43,8 +43,6 @@ class VolumeGuardAccessibilityService : AccessibilityService() {
     @Volatile
     var isOperationalFast: Boolean = false
         private set
-
-    val privacyMaskPlayer = PrivacyMaskPlayer()
 
     private val asyncCleanupHandler = Handler(Looper.getMainLooper())
     private var monitorThread: HandlerThread? = null
@@ -127,8 +125,9 @@ class VolumeGuardAccessibilityService : AccessibilityService() {
                 isOperationalFast = false
                 // 2. Synchronous state update and async preference persistence (ZERO audio IPC)
                 GuardManager.instance.onPhysicalVolumeUpFast(this)
-                // 3. Post monitor, sampler, and masker cleanup asynchronously off the critical hot path
+                // 3. Post monitor and privacy mask cleanup asynchronously off the critical hot path
                 asyncCleanupHandler.post {
+                    PrivacyMaskService.stop(this)
                     setMonitorsActive(false)
                 }
             }
@@ -163,7 +162,6 @@ class VolumeGuardAccessibilityService : AccessibilityService() {
             Log.d(TAG, "onUnbind()")
         }
         setMonitorsActive(false)
-        privacyMaskPlayer.release()
         GuardManager.instance.onServiceDisconnected(this)
         return super.onUnbind(intent)
     }
@@ -174,21 +172,18 @@ class VolumeGuardAccessibilityService : AccessibilityService() {
             Log.d(TAG, "onDestroy()")
         }
         setMonitorsActive(false)
-        privacyMaskPlayer.release()
         GuardManager.instance.onServiceDisconnected(this)
     }
 
     /**
-     * Activates or deactivates monitors, continuous 10 ms safety sampler, and privacy masking.
+     * Activates or deactivates monitors and continuous 10 ms safety sampler.
      */
     fun setMonitorsActive(active: Boolean) {
         isOperationalFast = active
         if (active) {
             registerMonitors()
             startContinuousSampler()
-            privacyMaskPlayer.start()
         } else {
-            privacyMaskPlayer.stop()
             stopContinuousSampler()
             unregisterMonitors()
         }

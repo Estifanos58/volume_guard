@@ -1,62 +1,100 @@
 package com.example.audio
 
+import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
 import android.util.Log
 import com.example.BuildConfig
+import java.io.InputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+
+/**
+ * State machine for the privacy mask player.
+ */
+enum class MaskState {
+    STOPPED,
+    STARTING,
+    PLAYING,
+    FAILED
+}
 
 /**
  * Lightweight, continuous privacy masking audio player.
  *
- * Purpose:
- * Pre-plays a low-overhead, speech-shaped broadband noise signal using [AudioTrack.MODE_STATIC].
- * While Guard is active (STREAM_MUSIC = 0), this audio is inaudible.
- * If another app programmatically raises STREAM_MUSIC, this masking audio bursts through
- * simultaneously with the rogue audio, obscuring speech intelligibility during the
- * 10 ms detection-and-clamping window.
- *
  * Operational Contract:
- * - Uses exactly one static AudioTrack with pre-generated 1-second speech-shaped noise.
- * - Mono, 16-bit PCM, 16 kHz sample rate (only 32 KB memory footprint).
- * - Zero runtime allocations or continuous sample generation.
+ * - Pre-loads a 1-second 16 kHz 16-bit mono speech-shaped noise PCM asset (32 KB).
+ * - Uses exactly one static AudioTrack with [AudioTrack.MODE_STATIC] looped infinitely.
+ * - Formal state machine: [MaskState.STOPPED], [MaskState.STARTING], [MaskState.PLAYING], [MaskState.FAILED].
+ * - Only reports PLAYING after AudioTrack successfully initializes and verify playState == PLAYSTATE_PLAYING.
+ * - Zero continuous runtime allocations or continuous random number generation.
  * - Does NOT request audio focus (relies on Android's native stream mixing).
  * - NOT a protection or volume-checking mechanism.
- * - Robust: If AudioTrack fails on any device/emulator, protection continues uninterrupted.
+ * - Safe fail-over: If AudioTrack fails, reports FAILED and allows Volume Guard to continue.
  */
-class PrivacyMaskPlayer {
+class PrivacyMaskPlayer(private val context: Context) {
 
     @Volatile
-    var isStarted: Boolean = false
+    var state: MaskState = MaskState.STOPPED
         private set
+
+    @Volatile
+    private var currentSessionId: Long = 0L
 
     private var audioTrack: AudioTrack? = null
     private var pcmBuffer: ShortArray? = null
 
     /**
-     * Starts continuous looping masking playback if not already started.
-     * Thread-safe and idempotent.
+     * Starts continuous looping masking playback.
+     * Synchronized and idempotent.
      */
     @Synchronized
-    fun start() {
-        if (isStarted && audioTrack?.playState == AudioTrack.PLAYSTATE_PLAYING) return
-        isStarted = true
+    fun start(): Boolean {
+        if (state == MaskState.PLAYING && audioTrack?.playState == AudioTrack.PLAYSTATE_PLAYING) {
+            return true
+        }
+
+        currentSessionId++
+        val session = currentSessionId
+        state = MaskState.STARTING
 
         try {
             ensureTrackInitialized()
-            val track = audioTrack ?: return
+            val track = audioTrack ?: run {
+                state = MaskState.FAILED
+                return false
+            }
+
+            if (session != currentSessionId) {
+                // Superseded by newer session
+                return false
+            }
 
             track.reloadStaticData()
             track.setLoopPoints(0, pcmBuffer?.size ?: 0, -1)
             track.play()
 
-            if (BuildConfig.DEBUG) {
-                Log.d(TAG, "Privacy mask audio track started (looping)")
+            // Verify playback state before claiming PLAYING
+            if (track.playState == AudioTrack.PLAYSTATE_PLAYING) {
+                state = MaskState.PLAYING
+                if (BuildConfig.DEBUG) {
+                    Log.d(TAG, "Privacy mask AudioTrack PLAYING (session=$session)")
+                }
+                return true
+            } else {
+                state = MaskState.FAILED
+                if (BuildConfig.DEBUG) {
+                    Log.w(TAG, "AudioTrack play() succeeded but playState is not PLAYING: ${track.playState}")
+                }
+                return false
             }
         } catch (e: Throwable) {
+            state = MaskState.FAILED
             if (BuildConfig.DEBUG) {
-                Log.w(TAG, "AudioTrack hardware playback unavailable; masking inactive", e)
+                Log.w(TAG, "Failed to start privacy mask AudioTrack; masking unavailable", e)
             }
+            return false
         }
     }
 
@@ -65,7 +103,9 @@ class PrivacyMaskPlayer {
      */
     @Synchronized
     fun stop() {
-        isStarted = false
+        currentSessionId++
+        state = MaskState.STOPPED
+
         try {
             audioTrack?.let { track ->
                 if (track.playState == AudioTrack.PLAYSTATE_PLAYING) {
@@ -79,8 +119,26 @@ class PrivacyMaskPlayer {
             }
         } finally {
             if (BuildConfig.DEBUG) {
-                Log.d(TAG, "Privacy mask audio track stopped")
+                Log.d(TAG, "Privacy mask AudioTrack STOPPED")
             }
+        }
+    }
+
+    /**
+     * Checks if the track is still healthy and playing; attempts recovery if stalled.
+     * Called by the 200 ms watchdog.
+     */
+    @Synchronized
+    fun checkHealthAndRecover() {
+        if (state != MaskState.PLAYING) return
+
+        val track = audioTrack
+        if (track == null || track.playState != AudioTrack.PLAYSTATE_PLAYING) {
+            if (BuildConfig.DEBUG) {
+                Log.w(TAG, "Watchdog detected stalled AudioTrack (state=$state, playState=${track?.playState}) -> recovering")
+            }
+            // Attempt restart
+            start()
         }
     }
 
@@ -99,9 +157,9 @@ class PrivacyMaskPlayer {
         } finally {
             audioTrack = null
             pcmBuffer = null
-            isStarted = false
+            state = MaskState.STOPPED
             if (BuildConfig.DEBUG) {
-                Log.d(TAG, "Privacy mask audio track released")
+                Log.d(TAG, "Privacy mask AudioTrack released")
             }
         }
     }
@@ -109,11 +167,7 @@ class PrivacyMaskPlayer {
     private fun ensureTrackInitialized() {
         if (audioTrack != null) return
 
-        val buffer = pcmBuffer ?: generateSpeechShapedNoise(
-            sampleRate = SAMPLE_RATE,
-            durationSeconds = DURATION_SECONDS,
-            gain = DEFAULT_MASK_GAIN
-        ).also { pcmBuffer = it }
+        val buffer = pcmBuffer ?: loadOrGenerateBuffer().also { pcmBuffer = it }
 
         val attributes = AudioAttributes.Builder()
             .setUsage(AudioAttributes.USAGE_MEDIA)
@@ -126,7 +180,7 @@ class PrivacyMaskPlayer {
             .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
             .build()
 
-        val bufferSizeBytes = buffer.size * 2 // 16-bit = 2 bytes per sample
+        val bufferSizeBytes = buffer.size * 2 // 16-bit PCM = 2 bytes per sample
 
         val track = AudioTrack.Builder()
             .setAudioAttributes(attributes)
@@ -144,23 +198,42 @@ class PrivacyMaskPlayer {
         audioTrack = track
     }
 
+    private fun loadOrGenerateBuffer(): ShortArray {
+        // 1. Try loading pre-generated 1-second 16kHz asset
+        try {
+            val assetStream: InputStream = context.assets.open(ASSET_FILE_NAME)
+            val bytes = assetStream.readBytes()
+            assetStream.close()
+
+            if (bytes.size >= 32000) {
+                val shortBuffer = ShortArray(bytes.size / 2)
+                ByteBuffer.wrap(bytes)
+                    .order(ByteOrder.LITTLE_ENDIAN)
+                    .asShortBuffer()
+                    .get(shortBuffer)
+                if (BuildConfig.DEBUG) {
+                    Log.d(TAG, "Loaded pre-generated PCM asset (${bytes.size} bytes)")
+                }
+                return shortBuffer
+            }
+        } catch (e: Exception) {
+            if (BuildConfig.DEBUG) {
+                Log.w(TAG, "Could not load asset $ASSET_FILE_NAME, falling back to static generator", e)
+            }
+        }
+
+        // 2. Deterministic fallback generator
+        return generateSpeechShapedNoise(SAMPLE_RATE, DURATION_SECONDS, DEFAULT_MASK_GAIN)
+    }
+
     companion object {
         private const val TAG = "PrivacyMaskPlayer"
+        private const val ASSET_FILE_NAME = "privacy_mask_16k.pcm"
 
         const val SAMPLE_RATE = 16000
         const val DURATION_SECONDS = 1.0f
-
-        /**
-         * Conservative amplitude gain (0.0 to 1.0) to prevent clipping/distortion
-         * while effectively obscuring speech comprehension.
-         */
         const val DEFAULT_MASK_GAIN = 0.45f
 
-        /**
-         * Pre-generates deterministic speech-shaped broadband noise.
-         * Uses a 1st-order IIR low-pass filter (~1 kHz cutoff) over pseudo-random noise
-         * to approximate conversational speech frequency distribution (250 Hz - 3500 Hz).
-         */
         fun generateSpeechShapedNoise(
             sampleRate: Int,
             durationSeconds: Float,
@@ -170,11 +243,10 @@ class PrivacyMaskPlayer {
             val buffer = ShortArray(numSamples)
             var seed = 987654321L
             var filterState = 0.0
-            val alpha = 0.28 // Low-pass filter coefficient (~1 kHz at 16 kHz sample rate)
+            val alpha = 0.28
             val maxAmplitude = 32767.0 * gain.coerceIn(0.05f, 1.0f)
 
             for (i in 0 until numSamples) {
-                // Linear congruential generator for fast, allocation-free pseudo-random numbers
                 seed = (seed * 1103515245L + 12345L) and 0x7fffffffL
                 val white = (seed.toDouble() / 0x7fffffffL) * 2.0 - 1.0
                 filterState += alpha * (white - filterState)
