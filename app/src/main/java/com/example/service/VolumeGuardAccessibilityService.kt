@@ -10,7 +10,7 @@ import android.provider.Settings
 import android.util.Log
 import android.view.KeyEvent
 import android.view.accessibility.AccessibilityEvent
-import androidx.core.content.ContextCompat
+import com.example.BuildConfig
 import com.example.core.GuardManager
 import com.example.observer.VolumeContentObserver
 import com.example.receiver.VolumeChangeReceiver
@@ -22,7 +22,7 @@ import com.example.receiver.VolumeChangeReceiver
  * Android allows an AccessibilityService with [flagRequestFilterKeyEvents] to intercept
  * raw hardware key events BEFORE they reach the WindowManager or the AudioService.
  *
- * Rules implemented here:
+ * Rules:
  * 1. Physical Volume Up while Guard is ON:
  *    - Immediately disengages Guard (State -> OFF).
  *    - Returns FALSE so Android continues processing the physical Volume Up normally
@@ -33,18 +33,21 @@ import com.example.receiver.VolumeChangeReceiver
  *    - Enforces volume 0.
  *    - Returns TRUE to consume the event and prevent unnecessary system UI/slider popups.
  *
- * 3. Reactive Monitoring:
- *    - While running, keeps reactive broadcast receiver and content observer active
- *      to guard against programmatic volume increases by third-party apps.
+ * 3. Reactive Volume Monitors:
+ *    - Broadcast receiver and ContentObserver are active ONLY while operational protection
+ *      is actually ACTIVE. When Guard is OFF or Service is disconnected, all background
+ *      monitors are completely unregistered to preserve battery.
  */
 class VolumeGuardAccessibilityService : AccessibilityService() {
 
     private var volumeChangeReceiver: VolumeChangeReceiver? = null
     private var volumeContentObserver: VolumeContentObserver? = null
 
-    override fun onServiceConnected() {
+    public override fun onServiceConnected() {
         super.onServiceConnected()
-        Log.i(TAG, "VolumeGuardAccessibilityService connected")
+        if (BuildConfig.DEBUG) {
+            Log.d(TAG, "onServiceConnected()")
+        }
 
         // Configure key filtering capability
         val info = serviceInfo ?: AccessibilityServiceInfo()
@@ -52,28 +55,22 @@ class VolumeGuardAccessibilityService : AccessibilityService() {
         info.feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
         serviceInfo = info
 
-        // Register reactive programmatic monitors
-        registerVolumeMonitors()
-
-        // Notify manager
-        GuardManager.instance.setAccessibilityServiceConnected(true, this)
-
-        // If guard was enabled in preferences, enforce volume zero immediately
-        if (GuardManager.instance.guardState.value.isEnabled) {
-            GuardManager.instance.forceMediaVolumeZero(this, reason = "Accessibility service connected")
+        // Connect to GuardManager and provide dynamic monitor control
+        GuardManager.instance.onServiceConnected(this) { active ->
+            setMonitorsActive(active)
         }
     }
 
-    override fun onKeyEvent(event: KeyEvent?): Boolean {
+    public override fun onKeyEvent(event: KeyEvent?): Boolean {
         if (event == null) return false
 
-        val isGuardOn = GuardManager.instance.guardState.value.isEnabled
-        if (!isGuardOn) {
-            // Normal Android operation when Guard is OFF
+        val isOperational = GuardManager.instance.isOperationalActive.value
+        if (!isOperational) {
+            // Normal Android operation when Guard is OFF or not operational
             return super.onKeyEvent(event)
         }
 
-        when (event.keyCode) {
+        return when (event.keyCode) {
             KeyEvent.KEYCODE_VOLUME_UP -> {
                 // User's intentional emergency/override button
                 if (event.action == KeyEvent.ACTION_DOWN) {
@@ -81,7 +78,7 @@ class VolumeGuardAccessibilityService : AccessibilityService() {
                 }
                 // CRITICAL: Do NOT consume the Volume Up event.
                 // Return false so Android processes the user's Volume Up normally and raises the volume!
-                return false
+                false
             }
 
             KeyEvent.KEYCODE_VOLUME_DOWN -> {
@@ -90,11 +87,11 @@ class VolumeGuardAccessibilityService : AccessibilityService() {
                     GuardManager.instance.onPhysicalVolumeDown(this)
                 }
                 // Consume event to prevent unnecessary OS processing since volume is already 0
-                return true
+                true
             }
 
             else -> {
-                return super.onKeyEvent(event)
+                super.onKeyEvent(event)
             }
         }
     }
@@ -104,24 +101,41 @@ class VolumeGuardAccessibilityService : AccessibilityService() {
     }
 
     override fun onInterrupt() {
-        Log.w(TAG, "Accessibility service interrupted")
+        if (BuildConfig.DEBUG) {
+            Log.d(TAG, "onInterrupt()")
+        }
     }
 
-    override fun onUnbind(intent: Intent?): Boolean {
-        Log.i(TAG, "Accessibility service unbound")
-        unregisterVolumeMonitors()
-        GuardManager.instance.setAccessibilityServiceConnected(false, null)
+    public override fun onUnbind(intent: Intent?): Boolean {
+        if (BuildConfig.DEBUG) {
+            Log.d(TAG, "onUnbind()")
+        }
+        setMonitorsActive(false)
+        GuardManager.instance.onServiceDisconnected()
         return super.onUnbind(intent)
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        Log.i(TAG, "Accessibility service destroyed")
-        unregisterVolumeMonitors()
-        GuardManager.instance.setAccessibilityServiceConnected(false, null)
+        if (BuildConfig.DEBUG) {
+            Log.d(TAG, "onDestroy()")
+        }
+        setMonitorsActive(false)
+        GuardManager.instance.onServiceDisconnected()
     }
 
-    private fun registerVolumeMonitors() {
+    /**
+     * Activates or deactivates reactive volume monitors dynamically based on operational state.
+     */
+    private fun setMonitorsActive(active: Boolean) {
+        if (active) {
+            registerMonitors()
+        } else {
+            unregisterMonitors()
+        }
+    }
+
+    private fun registerMonitors() {
         try {
             if (volumeChangeReceiver == null) {
                 volumeChangeReceiver = VolumeChangeReceiver()
@@ -130,6 +144,9 @@ class VolumeGuardAccessibilityService : AccessibilityService() {
                     registerReceiver(volumeChangeReceiver, filter, Context.RECEIVER_EXPORTED)
                 } else {
                     registerReceiver(volumeChangeReceiver, filter)
+                }
+                if (BuildConfig.DEBUG) {
+                    Log.d(TAG, "VolumeChangeReceiver registered")
                 }
             }
 
@@ -140,24 +157,37 @@ class VolumeGuardAccessibilityService : AccessibilityService() {
                     true,
                     volumeContentObserver!!
                 )
+                if (BuildConfig.DEBUG) {
+                    Log.d(TAG, "VolumeContentObserver registered")
+                }
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to register volume monitors", e)
+            if (BuildConfig.DEBUG) {
+                Log.e(TAG, "Failed to register volume monitors", e)
+            }
         }
     }
 
-    private fun unregisterVolumeMonitors() {
+    private fun unregisterMonitors() {
         try {
             volumeChangeReceiver?.let {
                 unregisterReceiver(it)
                 volumeChangeReceiver = null
+                if (BuildConfig.DEBUG) {
+                    Log.d(TAG, "VolumeChangeReceiver unregistered")
+                }
             }
             volumeContentObserver?.let {
                 contentResolver.unregisterContentObserver(it)
                 volumeContentObserver = null
+                if (BuildConfig.DEBUG) {
+                    Log.d(TAG, "VolumeContentObserver unregistered")
+                }
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Error unregistering volume monitors", e)
+            if (BuildConfig.DEBUG) {
+                Log.e(TAG, "Error unregistering volume monitors", e)
+            }
         }
     }
 

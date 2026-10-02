@@ -4,7 +4,6 @@ import android.content.Context
 import android.content.Intent
 import android.media.AudioManager
 import android.provider.Settings
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -22,8 +21,6 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.CheckCircle
-import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.VolumeDown
 import androidx.compose.material.icons.filled.VolumeMute
@@ -62,9 +59,9 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.BuildConfig
 import com.example.R
 import com.example.core.GuardManager
-import com.example.core.GuardState
 import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -74,18 +71,15 @@ fun VolumeGuardScreen(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
-    val guardState by guardManager.guardState.collectAsState()
+    val desiredEnabled by guardManager.desiredGuardEnabled.collectAsState()
     val isServiceConnected by guardManager.isServiceConnected.collectAsState()
+    val isOperationalActive by guardManager.isOperationalActive.collectAsState()
     val currentVolume by guardManager.currentMediaVolume.collectAsState()
     val maxVolume by guardManager.maxMediaVolume.collectAsState()
     val recentLogs by guardManager.recentLogs.collectAsState()
 
     val snackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
-
-    val isServiceEnabledInSettings = remember(isServiceConnected) {
-        guardManager.isAccessibilityServiceEnabledInSettings(context)
-    }
 
     Scaffold(
         modifier = modifier.fillMaxSize(),
@@ -126,10 +120,10 @@ fun VolumeGuardScreen(
                     .testTag("guard_control_card"),
                 shape = RoundedCornerShape(20.dp),
                 colors = CardDefaults.cardColors(
-                    containerColor = if (guardState.isEnabled) {
-                        MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f)
-                    } else {
-                        MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f)
+                    containerColor = when {
+                        isOperationalActive -> MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f)
+                        desiredEnabled && !isServiceConnected -> MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.4f)
+                        else -> MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f)
                     }
                 ),
                 elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
@@ -151,31 +145,35 @@ fun VolumeGuardScreen(
                                         .size(12.dp)
                                         .clip(CircleShape)
                                         .background(
-                                            if (guardState.isEnabled) Color(0xFF10B981) else Color(0xFF64748B)
+                                            when {
+                                                isOperationalActive -> Color(0xFF10B981)
+                                                desiredEnabled && !isServiceConnected -> Color(0xFFF59E0B)
+                                                else -> Color(0xFF64748B)
+                                            }
                                         )
                                 )
                                 Spacer(modifier = Modifier.width(8.dp))
                                 Text(
-                                    text = if (guardState.isEnabled) {
-                                        stringResource(R.string.guard_active)
-                                    } else {
-                                        stringResource(R.string.guard_inactive)
+                                    text = when {
+                                        isOperationalActive -> stringResource(R.string.guard_active)
+                                        desiredEnabled && !isServiceConnected -> "Protection Inactive"
+                                        else -> stringResource(R.string.guard_inactive)
                                     },
                                     style = MaterialTheme.typography.titleMedium,
                                     fontWeight = FontWeight.Bold,
-                                    color = if (guardState.isEnabled) {
-                                        MaterialTheme.colorScheme.primary
-                                    } else {
-                                        MaterialTheme.colorScheme.onSurfaceVariant
+                                    color = when {
+                                        isOperationalActive -> MaterialTheme.colorScheme.primary
+                                        desiredEnabled && !isServiceConnected -> Color(0xFFB45309)
+                                        else -> MaterialTheme.colorScheme.onSurfaceVariant
                                     }
                                 )
                             }
                             Spacer(modifier = Modifier.height(4.dp))
                             Text(
-                                text = if (guardState.isEnabled) {
-                                    stringResource(R.string.volume_target_info)
-                                } else {
-                                    "Normal Android volume control"
+                                text = when {
+                                    isOperationalActive -> stringResource(R.string.volume_target_info)
+                                    desiredEnabled && !isServiceConnected -> "Service disconnected — key interception unavailable"
+                                    else -> "Normal Android volume control"
                                 },
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -183,19 +181,15 @@ fun VolumeGuardScreen(
                         }
 
                         Switch(
-                            checked = guardState.isEnabled,
+                            checked = desiredEnabled,
                             onCheckedChange = { enable ->
-                                if (enable) {
-                                    val success = guardManager.enableGuard(context)
-                                    if (!success) {
-                                        scope.launch {
-                                            snackbarHostState.showSnackbar(
-                                                "Enable Accessibility Service in Android Settings first."
-                                            )
-                                        }
+                                guardManager.setDesiredGuardEnabled(context, enable)
+                                if (enable && !isServiceConnected) {
+                                    scope.launch {
+                                        snackbarHostState.showSnackbar(
+                                            "Accessibility Service is disconnected. Enable it in settings for hardware protection."
+                                        )
                                     }
-                                } else {
-                                    guardManager.disableGuard(context, reason = "User toggled switch OFF")
                                 }
                             },
                             modifier = Modifier.testTag("guard_toggle_switch"),
@@ -210,8 +204,8 @@ fun VolumeGuardScreen(
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            // Accessibility Service Warning if not enabled
-            if (!isServiceConnected && !isServiceEnabledInSettings) {
+            // Accessibility Service Warning if not connected
+            if (!isServiceConnected) {
                 Card(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -332,7 +326,7 @@ fun VolumeGuardScreen(
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            // Telemetry / Status strip
+            // Telemetry strip
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween
@@ -379,108 +373,109 @@ fun VolumeGuardScreen(
                         )
                         Spacer(modifier = Modifier.height(4.dp))
                         Text(
-                            text = if (isServiceConnected) "CONNECTED" else if (isServiceEnabledInSettings) "STANDBY" else "DISABLED",
+                            text = if (isServiceConnected) "CONNECTED" else "DISCONNECTED",
                             style = MaterialTheme.typography.titleSmall,
                             fontWeight = FontWeight.Bold,
-                            color = if (isServiceConnected || isServiceEnabledInSettings) Color(0xFF10B981) else Color(0xFFEF4444)
+                            color = if (isServiceConnected) Color(0xFF10B981) else Color(0xFFEF4444)
                         )
                     }
                 }
             }
 
-            Spacer(modifier = Modifier.height(16.dp))
+            // Gated Debug Tools: Rendered only in Debug builds
+            if (BuildConfig.DEBUG) {
+                Spacer(modifier = Modifier.height(16.dp))
 
-            // Testing / Simulation buttons
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                OutlinedButton(
-                    onClick = {
-                        guardManager.forceMediaVolumeZero(context, reason = "Manual zero button")
-                    },
-                    modifier = Modifier
-                        .weight(1f)
-                        .testTag("manual_zero_button")
+                // Testing / Simulation buttons
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Icon(
-                        imageVector = Icons.Default.VolumeMute,
-                        contentDescription = null,
-                        modifier = Modifier.size(16.dp)
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text("Zero Now", fontSize = 12.sp)
+                    OutlinedButton(
+                        onClick = {
+                            guardManager.forceMediaVolumeZero(context, reason = "Manual zero button")
+                        },
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("manual_zero_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.VolumeMute,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Zero Now", fontSize = 12.sp)
+                    }
+
+                    OutlinedButton(
+                        onClick = {
+                            val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+                            am?.setStreamVolume(AudioManager.STREAM_MUSIC, (maxVolume / 2).coerceAtLeast(1), 0)
+                            guardManager.syncSystemVolume(context)
+                        },
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("simulate_raise_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.VolumeUp,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Test Raise", fontSize = 12.sp)
+                    }
                 }
 
-                OutlinedButton(
-                    onClick = {
-                        // Simulate a rogue app raising volume to test the instantaneous reactive clamp
-                        val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-                        am?.setStreamVolume(AudioManager.STREAM_MUSIC, (maxVolume / 2).coerceAtLeast(1), 0)
-                        guardManager.syncSystemVolume(context)
-                    },
-                    modifier = Modifier
-                        .weight(1f)
-                        .testTag("simulate_raise_button")
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.VolumeUp,
-                        contentDescription = null,
-                        modifier = Modifier.size(16.dp)
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text("Test Raise", fontSize = 12.sp)
-                }
-            }
+                Spacer(modifier = Modifier.height(12.dp))
 
-            Spacer(modifier = Modifier.height(16.dp))
-
-            // Diagnostic event log
-            Text(
-                text = "SYSTEM LOG",
-                style = MaterialTheme.typography.labelMedium,
-                fontWeight = FontWeight.Bold,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-            Spacer(modifier = Modifier.height(6.dp))
-            Card(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .weight(1f)
-                    .testTag("log_card"),
-                shape = RoundedCornerShape(12.dp),
-                colors = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.2f)
+                Text(
+                    text = "DEBUG SYSTEM LOG",
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-            ) {
-                if (recentLogs.isEmpty()) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .padding(16.dp),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text(
-                            text = "No events logged yet",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
-                        )
-                    }
-                } else {
-                    LazyColumn(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .padding(8.dp),
-                        reverseLayout = true
-                    ) {
-                        items(recentLogs.reversed()) { logEntry ->
+                Spacer(modifier = Modifier.height(6.dp))
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f)
+                        .testTag("log_card"),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.2f)
+                    )
+                ) {
+                    if (recentLogs.isEmpty()) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(16.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
                             Text(
-                                text = logEntry,
+                                text = "No debug events logged",
                                 style = MaterialTheme.typography.bodySmall,
-                                fontFamily = FontFamily.Monospace,
-                                fontSize = 11.sp,
-                                modifier = Modifier.padding(vertical = 2.dp)
+                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
                             )
+                        }
+                    } else {
+                        LazyColumn(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(8.dp),
+                            reverseLayout = true
+                        ) {
+                            items(recentLogs.reversed()) { logEntry ->
+                                Text(
+                                    text = logEntry,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    fontFamily = FontFamily.Monospace,
+                                    fontSize = 11.sp,
+                                    modifier = Modifier.padding(vertical = 2.dp)
+                                )
+                            }
                         }
                     }
                 }
@@ -492,18 +487,13 @@ fun VolumeGuardScreen(
 private fun openAccessibilitySettings(context: Context) {
     try {
         val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).apply {
-            flags = IntentFilterFlags()
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
         }
         context.startActivity(intent)
     } catch (e: Exception) {
-        // Fallback to system settings
         val intent = Intent(Settings.ACTION_SETTINGS).apply {
-            flags = IntentFilterFlags()
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
         }
         context.startActivity(intent)
     }
-}
-
-private fun IntentFilterFlags(): Int {
-    return Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
 }

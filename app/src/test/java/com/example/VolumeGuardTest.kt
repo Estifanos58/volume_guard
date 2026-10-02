@@ -1,18 +1,23 @@
 package com.example
 
 import android.content.Context
+import android.content.Intent
 import android.media.AudioManager
+import android.view.KeyEvent
 import androidx.test.core.app.ApplicationProvider
 import com.example.core.GuardManager
 import com.example.core.GuardPreferences
-import com.example.core.GuardState
+import com.example.receiver.VolumeChangeReceiver
+import com.example.service.VolumeGuardAccessibilityService
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
+import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.android.controller.ServiceController
 import org.robolectric.annotation.Config
 
 @RunWith(RobolectricTestRunner::class)
@@ -22,6 +27,8 @@ class VolumeGuardTest {
     private lateinit var context: Context
     private lateinit var audioManager: AudioManager
     private lateinit var guardManager: GuardManager
+    private lateinit var serviceController: ServiceController<VolumeGuardAccessibilityService>
+    private lateinit var service: VolumeGuardAccessibilityService
 
     @Before
     fun setUp() {
@@ -29,167 +36,201 @@ class VolumeGuardTest {
         audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
         guardManager = GuardManager.instance
 
-        // Ensure clean state
-        guardManager.setAccessibilityServiceConnected(true, null)
-        guardManager.disableGuard(context, "Setup reset")
+        // Ensure fresh state in preferences
+        GuardPreferences.getInstance(context).isGuardEnabled = false
+
+        // Instantiate and connect service via Robolectric
+        serviceController = Robolectric.buildService(VolumeGuardAccessibilityService::class.java).create()
+        service = serviceController.get()
+        service.onServiceConnected()
     }
 
     /**
-     * Test 1 — Enable from non-zero volume:
-     * Phone volume = 10, Enable Guard -> volume = 0, Guard = ON
+     * Test 1 — Operational Activation:
+     * When user enables guard and AccessibilityService is connected,
+     * stream volume is immediately forced to 0 and operational protection becomes active.
      */
     @Test
-    fun test1_enableGuardFromNonZeroVolume() {
+    fun test1_enableGuardForcesVolumeZeroAndActivatesOperationalState() {
         audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, 10, 0)
         assertEquals(10, audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
 
-        val enabled = guardManager.enableGuard(context)
-        assertTrue("Guard should enable when accessibility service is connected", enabled)
-        assertEquals(GuardState.ON, guardManager.guardState.value)
-        assertEquals(0, audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
+        guardManager.setDesiredGuardEnabled(context, true)
+
+        assertTrue("Desired state must be ON", guardManager.desiredGuardEnabled.value)
+        assertTrue("Service must be connected", guardManager.isServiceConnected.value)
+        assertTrue("Protection must be operational", guardManager.isOperationalActive.value)
+        assertEquals("Volume must be immediately forced to 0", 0, audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
     }
 
     /**
-     * Test 2 — Enable from zero:
-     * Phone volume = 0, Enable Guard -> Guard = ON, volume = 0
+     * Test 2 — AccessibilityService.onKeyEvent(Volume Up):
+     * Physical Volume Up while Guard is active:
+     * - Must return FALSE so Android processes Volume Up normally to raise volume.
+     * - Must immediately disengage Guard (desired = OFF, operational = OFF).
+     * - Must persist OFF state.
+     * - Must not programmatically alter volume.
      */
     @Test
-    fun test2_enableGuardFromZeroVolume() {
-        audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0)
-        val enabled = guardManager.enableGuard(context)
-        assertTrue(enabled)
-        assertEquals(GuardState.ON, guardManager.guardState.value)
-        assertEquals(0, audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
+    fun test2_serviceOnKeyEventVolumeUpReturnsFalseAndDisengagesGuard() {
+        guardManager.setDesiredGuardEnabled(context, true)
+        assertTrue(guardManager.isOperationalActive.value)
+
+        val volumeUpEvent = KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_VOLUME_UP)
+        val consumed = service.onKeyEvent(volumeUpEvent)
+
+        assertFalse("Volume Up must return FALSE to let Android raise volume", consumed)
+        assertFalse("Guard desired state must become OFF", guardManager.desiredGuardEnabled.value)
+        assertFalse("Operational protection must become inactive", guardManager.isOperationalActive.value)
+        assertFalse("Persisted state must be OFF", GuardPreferences.getInstance(context).isGuardEnabled)
     }
 
     /**
-     * Test 3 — Volume Down:
-     * Guard ON, Press physical Volume Down -> Guard remains ON, volume remains 0
+     * Test 3 — AccessibilityService.onKeyEvent(Volume Down):
+     * Physical Volume Down while Guard is active:
+     * - Must return TRUE so the system volume panel and work are consumed.
+     * - Must keep Guard ON and operational.
+     * - Must ensure volume remains 0.
      */
     @Test
-    fun test3_physicalVolumeDownMaintainsGuardAndZero() {
-        guardManager.enableGuard(context)
-        assertEquals(GuardState.ON, guardManager.guardState.value)
+    fun test3_serviceOnKeyEventVolumeDownReturnsTrueAndMaintainsZero() {
+        guardManager.setDesiredGuardEnabled(context, true)
+        assertTrue(guardManager.isOperationalActive.value)
 
-        // Intercept physical Volume Down
-        guardManager.onPhysicalVolumeDown(context)
+        val volumeDownEvent = KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_VOLUME_DOWN)
+        val consumed = service.onKeyEvent(volumeDownEvent)
 
-        // Guard must remain ON and volume must be 0
-        assertEquals(GuardState.ON, guardManager.guardState.value)
-        assertEquals(0, audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
+        assertTrue("Volume Down must return TRUE to consume the event", consumed)
+        assertTrue("Guard must remain operational", guardManager.isOperationalActive.value)
+        assertEquals("Volume must remain 0", 0, audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
     }
 
     /**
-     * Test 4 — Volume Up:
-     * Guard ON, Press physical Volume Up -> Guard becomes OFF, volume can increase normally
+     * Test 4 — Service Disconnect:
+     * When AccessibilityService disconnects:
+     * - Operational protection must immediately become INACTIVE.
+     * - Hardware key protection must not be falsely claimed.
+     * - User's desired ON preference must be PRESERVED so it can recover on reconnect.
      */
     @Test
-    fun test4_physicalVolumeUpDisablesGuardAndAllowsVolumeIncrease() {
-        guardManager.enableGuard(context)
-        assertEquals(GuardState.ON, guardManager.guardState.value)
+    fun test4_serviceDisconnectDeactivatesOperationalProtectionWhilePreservingPreference() {
+        guardManager.setDesiredGuardEnabled(context, true)
+        assertTrue(guardManager.isOperationalActive.value)
 
-        // User physically presses Volume Up (emergency override)
-        guardManager.onPhysicalVolumeUp(context)
+        // Service unbinds / disconnects
+        service.onUnbind(null)
 
-        // Guard must be OFF immediately
-        assertEquals(GuardState.OFF, guardManager.guardState.value)
-        assertFalse(GuardPreferences.getInstance(context).isGuardEnabled)
-
-        // Now external volume changes proceed without being clamped
-        audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, 1, 0)
-        guardManager.onExternalVolumeChanged(context, 1)
-        assertEquals(1, audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
+        assertFalse("Service connected must be false", guardManager.isServiceConnected.value)
+        assertFalse("Operational protection must be inactive when service is disconnected", guardManager.isOperationalActive.value)
+        assertTrue("User desired preference must be preserved", guardManager.desiredGuardEnabled.value)
+        assertTrue("Persisted preference must remain ON", GuardPreferences.getInstance(context).isGuardEnabled)
     }
 
     /**
-     * Test 5 — App attempts volume increase:
-     * Guard ON, Another app attempts to increase media volume -> Corrected immediately to 0
+     * Test 5 — Service Reconnect Restoration:
+     * When AccessibilityService reconnects after reboot or process death:
+     * - Automatically loads persisted ON preference.
+     * - Immediately clamps media volume to 0.
+     * - Becomes operationally active without needing Activity interaction.
      */
     @Test
-    fun test5_appAttemptsVolumeIncreaseIsCorrectedToZero() {
-        guardManager.enableGuard(context)
-        assertEquals(0, audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
+    fun test5_serviceReconnectRestoresPersistedPreferenceAndEnforcesZero() {
+        // Set persisted preference to ON while service is disconnected
+        GuardPreferences.getInstance(context).isGuardEnabled = true
+        guardManager.onServiceDisconnected()
+        assertFalse(guardManager.isOperationalActive.value)
 
-        // Rogue app raises volume to 8
         audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, 8, 0)
-        guardManager.onExternalVolumeChanged(context, 8)
+        assertEquals(8, audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
 
-        // Instant correction
-        assertEquals(0, audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
-        assertEquals(GuardState.ON, guardManager.guardState.value)
+        // New service connects (simulating OS starting/reconnecting the service)
+        val newServiceController = Robolectric.buildService(VolumeGuardAccessibilityService::class.java).create()
+        val newService = newServiceController.get()
+        newService.onServiceConnected()
+
+        assertTrue("Service connected should be true", guardManager.isServiceConnected.value)
+        assertTrue("Operational protection should recover to ACTIVE", guardManager.isOperationalActive.value)
+        assertEquals("Media volume must be forced to 0 on reconnection", 0, audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
     }
 
     /**
-     * Test 6 — Rapid Volume Up presses:
-     * Guard ON, Press Volume Up several times rapidly -> no crash, Guard becomes OFF idempotently
+     * Test 6 — Guard OFF:
+     * When Guard is OFF:
+     * - Physical keys pass through untouched.
+     * - Normal Android volume behavior is preserved.
      */
     @Test
-    fun test6_rapidVolumeUpPressesAreIdempotent() {
-        guardManager.enableGuard(context)
-        assertEquals(GuardState.ON, guardManager.guardState.value)
+    fun test6_guardOffAllowsNormalVolumeAndKeyEvents() {
+        guardManager.setDesiredGuardEnabled(context, false)
+        assertFalse(guardManager.isOperationalActive.value)
 
+        val volumeUpEvent = KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_VOLUME_UP)
+        val consumed = service.onKeyEvent(volumeUpEvent)
+        assertFalse("Volume Up must pass through when Guard is OFF", consumed)
+
+        audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, 6, 0)
+        assertEquals(6, audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
+    }
+
+    /**
+     * Test 7 — Reactive Receiver Path:
+     * When Guard is active and a rogue app triggers an external volume change broadcast,
+     * VolumeChangeReceiver immediately clamps volume back to 0.
+     */
+    @Test
+    fun test7_reactiveReceiverClampsExternalVolumeToZero() {
+        guardManager.setDesiredGuardEnabled(context, true)
+        assertEquals(0, audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
+
+        // Rogue app raises volume
+        audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, 12, 0)
+
+        // Broadcast received
+        val receiver = VolumeChangeReceiver()
+        val intent = Intent(VolumeChangeReceiver.VOLUME_CHANGED_ACTION).apply {
+            putExtra(VolumeChangeReceiver.EXTRA_VOLUME_STREAM_TYPE, AudioManager.STREAM_MUSIC)
+            putExtra(VolumeChangeReceiver.EXTRA_VOLUME_STREAM_VALUE, 12)
+        }
+        receiver.onReceive(context, intent)
+
+        assertEquals("Media volume must be immediately corrected to 0", 0, audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
+    }
+
+    /**
+     * Test 8 — Rapid Volume Up events are safe/idempotent:
+     * Multiple rapid Volume Up events must not crash or cause inconsistent state.
+     */
+    @Test
+    fun test8_rapidVolumeUpEventsAreSafeAndIdempotent() {
+        guardManager.setDesiredGuardEnabled(context, true)
+        assertTrue(guardManager.isOperationalActive.value)
+
+        val event = KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_VOLUME_UP)
         repeat(5) {
-            guardManager.onPhysicalVolumeUp(context)
+            val consumed = service.onKeyEvent(event)
+            assertFalse(consumed)
         }
 
-        assertEquals(GuardState.OFF, guardManager.guardState.value)
-        assertFalse(GuardPreferences.getInstance(context).isGuardEnabled)
+        assertFalse(guardManager.desiredGuardEnabled.value)
+        assertFalse(guardManager.isOperationalActive.value)
     }
 
     /**
-     * Test 7 — App UI disabled:
-     * Guard OFF, Press Volume Up -> normal Android behavior
+     * Test 9 — No Initial/Previous Volume Persistence:
+     * Verify that GuardPreferences only stores a boolean and never tracks or restores previous volume.
      */
     @Test
-    fun test7_guardOffAllowsNormalVolume() {
-        guardManager.disableGuard(context, "Test 7")
-        assertEquals(GuardState.OFF, guardManager.guardState.value)
+    fun test9_noInitialVolumeStorageOrRestoration() {
+        audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, 9, 0)
 
-        audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, 5, 0)
-        guardManager.onExternalVolumeChanged(context, 5)
-
-        assertEquals(5, audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
-    }
-
-    /**
-     * Test 8 — Disable from UI:
-     * Disable from UI -> Guard becomes OFF, volume is NOT changed/restored
-     */
-    @Test
-    fun test8_disableFromUIDoesNotRestorePreviousVolume() {
-        guardManager.enableGuard(context)
+        // Enable guard
+        guardManager.setDesiredGuardEnabled(context, true)
         assertEquals(0, audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
 
-        // Disable from UI
-        guardManager.disableGuard(context, "User toggle")
-        assertEquals(GuardState.OFF, guardManager.guardState.value)
+        // Disable guard from UI
+        guardManager.setDesiredGuardEnabled(context, false)
 
-        // Volume MUST remain 0, NOT raised or restored to any previous level
-        assertEquals(0, audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
-    }
-
-    /**
-     * Test 9 — Accessibility service unavailable:
-     * Accessibility service OFF, attempt to enable protection -> rejected
-     */
-    @Test
-    fun test9_cannotEnableWithoutAccessibilityService() {
-        guardManager.setAccessibilityServiceConnected(false, null)
-        val success = guardManager.enableGuard(context)
-        assertFalse("Must not enable guard if accessibility service is unavailable", success)
-        assertEquals(GuardState.OFF, guardManager.guardState.value)
-    }
-
-    /**
-     * Test 10 — No initial volume storage:
-     * Verify preference stores only a boolean, never any previous volume integer
-     */
-    @Test
-    fun test10_noInitialVolumeStorage() {
-        val prefs = GuardPreferences.getInstance(context)
-        prefs.isGuardEnabled = true
-        assertTrue(prefs.isGuardEnabled)
-        prefs.isGuardEnabled = false
-        assertFalse(prefs.isGuardEnabled)
+        // Volume MUST remain at 0, not restored to 9
+        assertEquals("Disabling guard must NOT restore previous volume", 0, audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
     }
 }
