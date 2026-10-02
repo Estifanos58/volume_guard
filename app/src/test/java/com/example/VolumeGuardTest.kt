@@ -5,6 +5,7 @@ import android.content.Intent
 import android.media.AudioManager
 import android.view.KeyEvent
 import androidx.test.core.app.ApplicationProvider
+import com.example.audio.PrivacyMaskPlayer
 import com.example.core.GuardManager
 import com.example.core.GuardPreferences
 import com.example.observer.VolumeContentObserver
@@ -12,6 +13,7 @@ import com.example.receiver.VolumeChangeReceiver
 import com.example.service.VolumeGuardAccessibilityService
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -20,6 +22,7 @@ import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.android.controller.ServiceController
 import org.robolectric.annotation.Config
+import org.robolectric.shadows.ShadowLooper
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [36])
@@ -51,7 +54,8 @@ class VolumeGuardTest {
     /**
      * Test 1 — Operational Activation:
      * When user enables guard and AccessibilityService is connected,
-     * stream volume is immediately forced to 0 and operational protection becomes active.
+     * stream volume is immediately forced to 0, operational protection becomes active,
+     * and privacy masking is started.
      */
     @Test
     fun test1_enableGuardForcesVolumeZeroAndActivatesOperationalState() {
@@ -66,6 +70,7 @@ class VolumeGuardTest {
         assertTrue("Fast hot-path flag must be true", service.isOperationalFast)
         assertEquals("Volume must be immediately forced to 0", 0, audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
         assertEquals("Cached volume must be 0", 0, guardManager.lastKnownMediaVolume)
+        assertTrue("Privacy masking should be active while Guard is operational", service.privacyMaskPlayer.isStarted)
     }
 
     /**
@@ -74,12 +79,14 @@ class VolumeGuardTest {
      * - Must return FALSE so Android processes Volume Up normally to raise volume.
      * - Must immediately disengage Guard (desired = OFF, operational = OFF).
      * - Must persist OFF state.
+     * - Must stop privacy masking asynchronously.
      * - Must NOT make any audio IPC calls (leaves volume untouched for Android to raise).
      */
     @Test
     fun test2_serviceOnKeyEventVolumeUpReturnsFalseAndDisengagesGuardWithoutAudioIpc() {
         guardManager.setDesiredGuardEnabled(context, true)
         assertTrue(guardManager.isOperationalActive.value)
+        assertTrue(service.privacyMaskPlayer.isStarted)
 
         val volumeUpEvent = KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_VOLUME_UP)
         val consumed = service.onKeyEvent(volumeUpEvent)
@@ -89,6 +96,10 @@ class VolumeGuardTest {
         assertFalse("Operational protection must become inactive", guardManager.isOperationalActive.value)
         assertFalse("Fast hot-path flag must become false", service.isOperationalFast)
         assertFalse("Persisted state must be OFF", GuardPreferences.getInstance(context).isGuardEnabled)
+
+        // Process asynchronous monitor and masker cleanup posted off the hot path
+        ShadowLooper.idleMainLooper()
+        assertFalse("Masker must be stopped after async cleanup", service.privacyMaskPlayer.isStarted)
     }
 
     /**
@@ -116,12 +127,14 @@ class VolumeGuardTest {
      * Test 4 — Service Disconnect:
      * When AccessibilityService disconnects:
      * - Operational protection must immediately become INACTIVE.
+     * - Privacy masking must be stopped and released.
      * - User's desired ON preference is PRESERVED for reconnection.
      */
     @Test
     fun test4_serviceDisconnectDeactivatesOperationalProtectionWhilePreservingPreference() {
         guardManager.setDesiredGuardEnabled(context, true)
         assertTrue(guardManager.isOperationalActive.value)
+        assertTrue(service.privacyMaskPlayer.isStarted)
 
         // Service unbinds / disconnects
         service.onUnbind(null)
@@ -129,6 +142,7 @@ class VolumeGuardTest {
         assertFalse("Service connected must be false", guardManager.isServiceConnected.value)
         assertFalse("Operational protection must be inactive when service is disconnected", guardManager.isOperationalActive.value)
         assertFalse("Fast hot-path flag must be false when service is unbound", service.isOperationalFast)
+        assertFalse("Masker must be stopped on service disconnect", service.privacyMaskPlayer.isStarted)
         assertTrue("User desired preference must be preserved", guardManager.desiredGuardEnabled.value)
         assertTrue("Persisted preference must remain ON", GuardPreferences.getInstance(context).isGuardEnabled)
     }
@@ -159,18 +173,21 @@ class VolumeGuardTest {
         assertTrue("Operational protection should recover to ACTIVE", guardManager.isOperationalActive.value)
         assertTrue("Fast hot-path flag must be active", newService.isOperationalFast)
         assertEquals("Media volume must be forced to 0 on reconnection", 0, audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
+        assertTrue("Privacy masking should start on reconnect", newService.privacyMaskPlayer.isStarted)
     }
 
     /**
      * Test 6 — Guard OFF:
      * When Guard is OFF:
      * - Physical keys pass through untouched.
+     * - Privacy masking is OFF.
      * - Normal Android volume behavior is preserved.
      */
     @Test
     fun test6_guardOffAllowsNormalVolumeAndKeyEvents() {
         guardManager.setDesiredGuardEnabled(context, false)
         assertFalse(guardManager.isOperationalActive.value)
+        assertFalse(service.privacyMaskPlayer.isStarted)
 
         val volumeUpEvent = KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_VOLUME_UP)
         val consumed = service.onKeyEvent(volumeUpEvent)
@@ -313,5 +330,81 @@ class VolumeGuardTest {
 
         // Volume MUST remain at 0, not restored to 9
         assertEquals("Disabling guard must NOT restore previous volume", 0, audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
+    }
+
+    /**
+     * Test 14 — PrivacyMaskPlayer Lifecycle & Idempotence:
+     * Verifies that start/stop/release are idempotent and don't throw.
+     */
+    @Test
+    fun test14_privacyMaskPlayerLifecycleAndIdempotence() {
+        val player = PrivacyMaskPlayer()
+        assertFalse(player.isStarted)
+
+        // Repeated starts should be idempotent
+        player.start()
+        assertTrue(player.isStarted)
+        player.start()
+        assertTrue(player.isStarted)
+
+        // Repeated stops should be idempotent
+        player.stop()
+        assertFalse(player.isStarted)
+        player.stop()
+        assertFalse(player.isStarted)
+
+        // Release
+        player.release()
+        assertFalse(player.isStarted)
+        player.release()
+    }
+
+    /**
+     * Test 15 — PrivacyMaskPlayer Pre-Generated Noise Buffer:
+     * Verifies that the noise buffer generation is deterministic, non-empty, and bounded.
+     */
+    @Test
+    fun test15_speechShapedNoiseBufferProperties() {
+        val buffer = PrivacyMaskPlayer.generateSpeechShapedNoise(
+            sampleRate = 16000,
+            durationSeconds = 1.0f,
+            gain = 0.5f
+        )
+        assertNotNull(buffer)
+        assertEquals(16000, buffer.size)
+
+        var hasNonZero = false
+        for (sample in buffer) {
+            if (sample.toInt() != 0) {
+                hasNonZero = true
+                break
+            }
+        }
+        assertTrue("Buffer must contain active audio samples", hasNonZero)
+    }
+
+    /**
+     * Test 16 — Detector Functions Even If Masker Fails:
+     * Verifies volume enforcement operates normally regardless of masker state.
+     */
+    @Test
+    fun test16_detectorFunctionsEvenIfMaskerFails() {
+        guardManager.setDesiredGuardEnabled(context, true)
+        // Explicitly release masker to simulate audio track failure
+        service.privacyMaskPlayer.release()
+        assertFalse(service.privacyMaskPlayer.isStarted)
+
+        // External app raises volume
+        audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, 11, 0)
+
+        // Receiver still clamps volume to 0
+        val receiver = VolumeChangeReceiver()
+        val intent = Intent(VolumeChangeReceiver.VOLUME_CHANGED_ACTION).apply {
+            putExtra(VolumeChangeReceiver.EXTRA_VOLUME_STREAM_TYPE, AudioManager.STREAM_MUSIC)
+            putExtra(VolumeChangeReceiver.EXTRA_VOLUME_STREAM_VALUE, 11)
+        }
+        receiver.onReceive(context, intent)
+
+        assertEquals("Volume enforcement must succeed independently of masker", 0, audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
     }
 }

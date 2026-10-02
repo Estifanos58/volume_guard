@@ -83,6 +83,15 @@
             android:textSize="13sp"
             android:textColor="?android:attr/textColorSecondary"
             android:layout_marginTop="6dp" />
+
+        <TextView
+            android:id="@+id/text_masking_status"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Privacy masking: ON while Guard is active"
+            android:textSize="12sp"
+            android:textColor="?android:attr/textColorSecondary"
+            android:layout_marginTop="4dp" />
     </LinearLayout>
 
     <Button

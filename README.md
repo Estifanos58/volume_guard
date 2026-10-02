@@ -8,13 +8,13 @@
 
 * **Target Volume:** Strictly **`0`** (`AudioManager.STREAM_MUSIC`).
 * **Zero Initial/Previous Volume Storage:** The app never records, remembers, or restores previous volume levels. Disabling the guard leaves volume at whatever value the system currently has.
-* **Deterministic Sub-Frame Reactive Correction:**
-  - Multi-channel detection: primary `VOLUME_CHANGED_ACTION` broadcast + fallback `ContentObserver` + continuous **10 ms** safety sampler while Guard is operational.
-  - Programmatic volume increases are forced back to `0` within tens of milliseconds even when Android or OEM broadcast delivery is delayed.
+* **Volume Enforcement vs. Privacy Masking:**
+  - **Volume Enforcement:** The core protection mechanism. Combines `VOLUME_CHANGED_ACTION`, targeted `ContentObserver`, and a continuous 10 ms safety sampler to detect and force `STREAM_MUSIC` back to `0` within tens of milliseconds.
+  - **Privacy Masking:** Supplemental, low-overhead audio layer (`AudioTrack.MODE_STATIC` speech-shaped noise) pre-playing while Guard is active. Inaudible at volume 0; if an app raises volume, the masking noise bursts through simultaneously with the rogue audio to obscure speech comprehension until volume enforcement clamps it back to 0.
 * **Guard Active + Physical Volume Up:**
   - Disengages the guard immediately (desired state -> `OFF`, operational state -> `inactive`).
   - Performs **zero audio Binder calls** on the input path.
-  - Schedules background monitor and sampler cleanup asynchronously off the input thread.
+  - Schedules background monitor, sampler, and masker cleanup asynchronously off the input thread.
   - Returns `false` from `onKeyEvent()` ASAP so Android receives the key event and raises volume normally.
 * **Guard Active + Physical Volume Down:**
   - Keeps the guard active.
@@ -26,9 +26,16 @@
 
 ---
 
-## 2. Multi-Channel Monitoring Architecture
+## 2. Multi-Channel Monitoring & Privacy Masking Architecture
 
 ```text
+                                  Guard ON
+                                     ↓
+              ┌──────────────────────────────────────────────┐
+              │  PrivacyMaskPlayer (AudioTrack.MODE_STATIC)  │
+              │  Pre-plays speech-shaped noise (inaudible 0) │
+              └──────────────────────────────────────────────┘
+                                     ↓
                      External App raises STREAM_MUSIC
                                      ↓
   ┌──────────────────────────────────┼──────────────────────────────────┐
@@ -42,7 +49,7 @@ VOLUME_CHANGED_ACTION           Settings.System                  10 ms interval
                                      ↓
                    Exactly ONE setStreamVolume(STREAM_MUSIC, 0, 0)
                                      ↓
-                    lastKnownMediaVolume reset to 0
+           Both rogue audio and privacy masking immediately silenced
 ```
 
 ### A. Dedicated Single Monitor HandlerThread
@@ -61,9 +68,13 @@ VOLUME_CHANGED_ACTION           Settings.System                  10 ms interval
 
 ### D. Channel 3: Continuous 10 ms Safety Sampler
 * Runs continuously on the monitor `HandlerThread` while Guard is operational, using a single reusable `Runnable` (zero per-tick allocations).
-* **Ungated:** Does not wait for `AudioPlaybackCallback` or `isMusicActive()`. Operates as a deterministic safety net for the entire duration Guard is active.
-* **Tick Hot Path:** Reads `getStreamVolume(STREAM_MUSIC)`. If `0`, immediately reschedules next tick with zero allocations. If `> 0`, clamps to `0` and logs detection.
-* Stops immediately when Guard is turned OFF.
+* Guarantees that any volume spike is caught and clamped within tens of milliseconds regardless of system or OEM broadcast delays.
+
+### E. Supplemental Privacy Masking (`PrivacyMaskPlayer`)
+* **Pre-Generated Noise Buffer:** 1 second of speech-shaped broadband noise (16 kHz mono 16-bit PCM, 32 KB RAM footprint).
+* **Static Looping AudioTrack:** Pre-loaded via `AudioTrack.MODE_STATIC` and looped infinitely.
+* **Simultaneous Audio Mixing:** Relies on Android's native multi-app stream mixing without requesting audio focus (`AUDIOFOCUS_GAIN`), avoiding background focus restrictions.
+* **Independent Enforcement:** The masker is purely supplemental; volume enforcement functions normally even if `AudioTrack` initialization fails.
 
 ---
 
@@ -75,7 +86,7 @@ In `VolumeGuardAccessibilityService.onKeyEvent()`:
   1. Flips `isOperationalFast = false` immediately.
   2. Transitions desired state to `OFF` synchronously.
   3. Dispatches SharedPreferences write asynchronously (`apply()`).
-  4. Posts monitor and sampler cleanup to background loop.
+  4. Posts monitor, sampler, and masker cleanup to background loop.
   5. Returns `false` immediately with **zero audio Binder calls** so Android handles volume up without delay.
 * **Physical Volume Down:**
   1. Checks `lastKnownMediaVolume`.
@@ -94,6 +105,7 @@ In `VolumeGuardAccessibilityService.onKeyEvent()`:
   - Guard ON/OFF toggle switch.
   - Concise operational status (`PROTECTED (Active)`, `GUARD OFF`, or `SERVICE DISCONNECTED`).
   - Current media volume readout (`Media Volume: 0`).
+  - Privacy masking status (`Privacy masking: ON while Guard is active`).
   - Direct button to open Android Accessibility Settings when service is not connected.
 
 ---
@@ -101,27 +113,11 @@ In `VolumeGuardAccessibilityService.onKeyEvent()`:
 ## 5. Platform Limitations on Unrooted Android
 
 * **Pre-Dispatch Hardware Key Interception:** Fully supported. Accessibility services with `flagRequestFilterKeyEvents` receive physical key events before the window manager or audio service.
-* **Programmatic Volume Interception:** On unrooted Android, third-party apps cannot pre-veto another application's IPC call to `AudioService`. The combination of `VOLUME_CHANGED_ACTION`, targeted `ContentObserver`, and the continuous 10 ms safety sampler provides the fastest practical recovery window available using public platform APIs without claiming impossible kernel-level vetoes.
+* **Programmatic Volume Interception:** On unrooted Android, third-party apps cannot pre-veto another application's IPC call to `AudioService`. The combination of `VOLUME_CHANGED_ACTION`, targeted `ContentObserver`, continuous 10 ms safety sampler, and the privacy masking layer provides defense-in-depth to minimize and obscure any momentary audio exposure.
 
 ---
 
-## 6. Tecno POP 7 Real-Device Testing & Benchmarking
-
-In debug builds (`BuildConfig.DEBUG`), every detection logs which channel caught the event:
-* `[broadcast] Reactive correction: total=...µs (ipc=...µs)`
-* `[observer] Caught volume change (...) -> clamping to 0`
-* `[sampler] Caught volume increase (...) -> clamped to 0`
-
-### Real-Device Test Checklist:
-1. **Background Audio Playback:** Start YouTube / Telegram audio. Toggle Guard ON. Volume drops to 0.
-2. **Programmatic Volume Attack:** External app calls `setStreamVolume(STREAM_MUSIC, 10, 0)`. Protection clamps volume to 0 within 10–20 ms.
-3. **Screen Off / Background:** Programmatic volume changes while screen is locked are caught by the 10 ms sampler even if the system delays broadcasts.
-4. **Physical Volume Up:** Press physical Volume Up. Guard disengages instantly, sampler stops, volume raises normally.
-5. **Physical Volume Down:** Press physical Volume Down. Consumed with zero volume sliders.
-
----
-
-## 7. How to Build & Install
+## 6. How to Build & Install
 
 ```bash
 # Build the debug APK:

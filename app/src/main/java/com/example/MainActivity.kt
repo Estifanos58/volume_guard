@@ -24,6 +24,7 @@ import kotlinx.coroutines.launch
  * - Guard toggle switch.
  * - Concise operational/service status.
  * - Current media volume.
+ * - Privacy masking indicator.
  * - Accessibility Settings button when service is unavailable.
  */
 class MainActivity : ComponentActivity() {
@@ -31,6 +32,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var switchGuard: Switch
     private lateinit var textStatus: TextView
     private lateinit var textVolume: TextView
+    private lateinit var textMaskingStatus: TextView
     private lateinit var buttonSettings: Button
 
     private var isUpdatingSwitchProgrammatically = false
@@ -43,6 +45,7 @@ class MainActivity : ComponentActivity() {
         switchGuard = findViewById(R.id.switch_guard)
         textStatus = findViewById(R.id.text_operational_status)
         textVolume = findViewById(R.id.text_current_volume)
+        textMaskingStatus = findViewById(R.id.text_masking_status)
         buttonSettings = findViewById(R.id.button_open_settings)
 
         val guardManager = GuardManager.instance
@@ -85,16 +88,20 @@ class MainActivity : ComponentActivity() {
                             operational -> {
                                 textStatus.text = "PROTECTED (Active)"
                                 textStatus.setTextColor(Color.parseColor("#4CAF50"))
+                                textMaskingStatus.text = "Privacy masking: ON while Guard is active"
+                                textMaskingStatus.visibility = View.VISIBLE
                                 buttonSettings.visibility = View.GONE
                             }
                             !connected -> {
                                 textStatus.text = "SERVICE DISCONNECTED"
                                 textStatus.setTextColor(Color.parseColor("#FF9800"))
+                                textMaskingStatus.visibility = View.GONE
                                 buttonSettings.visibility = View.VISIBLE
                             }
                             !desired -> {
                                 textStatus.text = "GUARD OFF"
                                 textStatus.setTextColor(Color.parseColor("#9E9E9E"))
+                                textMaskingStatus.visibility = View.GONE
                                 buttonSettings.visibility = View.GONE
                             }
                         }
